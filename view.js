@@ -4,6 +4,45 @@ import { Overlayer } from './overlayer.js'
 import { textWalker } from './text-walker.js'
 
 const SEARCH_PREFIX = 'foliate-search:'
+const SEARCH_ACTIVE_PREFIX = 'foliate-search-active:'
+
+// Paper-and-ink search match styling: a low-saturation parchment fill that
+// reads like a light marker stroke on the page. The active match gets a
+// stronger fill plus a hairline in the theme's text color ("ink").
+const SEARCH_FILL_COLOR = '#d6c9a8'
+const SEARCH_FILL_OPACITY = 0.32
+const SEARCH_ACTIVE_FILL_OPACITY = 0.5
+const SEARCH_ACTIVE_STROKE_WIDTH = 1
+
+const isSearchValue = value =>
+    value.startsWith(SEARCH_PREFIX) || value.startsWith(SEARCH_ACTIVE_PREFIX)
+
+const drawSearchMatch = active => rects => {
+    // Zero horizontal overhang: Overlayer.highlight extends the first/last
+    // rect by radiusPadding + padding on each side, which is fine for Latin
+    // (the overhang lands in word spacing) but paints over the neighbouring
+    // glyph in CJK text, where characters have no gap between them.
+    const g = Overlayer.highlight(rects, {
+        color: SEARCH_FILL_COLOR,
+        padding: 0,
+        radius: 3,
+        radiusPadding: 0,
+    })
+    g.style.opacity = active ? SEARCH_ACTIVE_FILL_OPACITY : SEARCH_FILL_OPACITY
+    const rootStyle = window.getComputedStyle(document.documentElement)
+    g.style.mixBlendMode =
+        rootStyle.getPropertyValue('--overlayer-highlight-blend-mode').trim() || 'normal'
+    if (active) {
+        const outline = Overlayer.outline(rects, {
+            color: 'currentColor',
+            width: SEARCH_ACTIVE_STROKE_WIDTH,
+            padding: 0,
+            radius: 3,
+        })
+        g.append(outline)
+    }
+    return g
+}
 
 const NOTE_PREFIX = 'foliate-note:'
 
@@ -227,6 +266,7 @@ export class View extends HTMLElement {
     #pageProgress
     #cfiProgress
     #searchResults = new Map()
+    #activeSearchCFI = null
     #cursorAutohider = new CursorAutohider(this, () =>
         this.hasAttribute('autohide-cursor'))
     isFixedLayout = false
@@ -312,6 +352,7 @@ export class View extends HTMLElement {
         this.#pageProgress = null
         this.#cfiProgress = null
         this.#searchResults = new Map()
+        this.#activeSearchCFI = null
         this.lastLocation = null
         this.history.clear()
         this.tts = null
@@ -388,8 +429,9 @@ export class View extends HTMLElement {
     }
     async addAnnotation(annotation, remove) {
         const { value } = annotation
-        if (value.startsWith(SEARCH_PREFIX)) {
-            const cfi = value.replace(SEARCH_PREFIX, '')
+        if (isSearchValue(value)) {
+            const active = value.startsWith(SEARCH_ACTIVE_PREFIX)
+            const cfi = value.replace(active ? SEARCH_ACTIVE_PREFIX : SEARCH_PREFIX, '')
             const { index, anchor } = await this.resolveNavigation(cfi)
             const obj = this.#getOverlayer(index)
             if (obj) {
@@ -399,7 +441,7 @@ export class View extends HTMLElement {
                     return
                 }
                 const range = doc ? anchor(doc) : anchor
-                if (range) overlayer.add(value, range, Overlayer.outline)
+                if (range) overlayer.add(value, range, drawSearchMatch(active))
             }
             return
         } else if (value.startsWith(NOTE_PREFIX)) {
@@ -447,7 +489,7 @@ export class View extends HTMLElement {
         const overlayer = new Overlayer(doc)
         doc.addEventListener('click', e => {
             const [value, range, rect] = overlayer.hitTest(e)
-            if (value && !value.startsWith(SEARCH_PREFIX)) {
+            if (value && !isSearchValue(value)) {
                 this.#emit('show-annotation', { value, index, range, rect })
             }
         }, false)
@@ -462,7 +504,7 @@ export class View extends HTMLElement {
             if (now - lastHitTestTime < THROTTLE_MS) return
             lastHitTestTime = now
             const [value] = overlayer.hitTest(e)
-            if (value && !value.startsWith(SEARCH_PREFIX)) {
+            if (value && !isSearchValue(value)) {
                 doc.body.style.cursor = 'pointer'
             } else {
                 doc.body.style.cursor = ''
@@ -471,6 +513,8 @@ export class View extends HTMLElement {
 
         const list = this.#searchResults.get(index)
         if (list) for (const item of list) this.addAnnotation(item)
+        if (this.#activeSearchCFI)
+            this.addAnnotation({ value: SEARCH_ACTIVE_PREFIX + this.#activeSearchCFI })
 
         this.#emit('create-overlay', { index })
         return overlayer
@@ -676,7 +720,22 @@ export class View extends HTMLElement {
         }
         yield 'done'
     }
+    // Highlight `cfi` as the current search match (pass null to clear).
+    // The active match is drawn under a separate key so switching is just a
+    // redraw of the old and new CFIs; it is not part of #searchResults.
+    async setSearchMatchActive(cfi) {
+        if (this.#activeSearchCFI === cfi) return
+        const prev = this.#activeSearchCFI
+        this.#activeSearchCFI = cfi
+        if (prev) await this.addAnnotation({ value: SEARCH_PREFIX + prev })
+        if (cfi) await this.addAnnotation({ value: SEARCH_ACTIVE_PREFIX + cfi })
+    }
     clearSearch() {
+        if (this.#activeSearchCFI) {
+            const active = this.#activeSearchCFI
+            this.#activeSearchCFI = null
+            this.deleteAnnotation({ value: SEARCH_ACTIVE_PREFIX + active })
+        }
         for (const list of this.#searchResults.values())
             for (const item of list) this.deleteAnnotation(item)
         this.#searchResults.clear()

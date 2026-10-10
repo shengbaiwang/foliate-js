@@ -132,17 +132,20 @@ const slideTurnAnimation = (element, scrollProp, endValue, exitSign, width, dura
     }, exitDuration + 10)
 })
 
-// Layered page-turn styles (readest#555). The `slide` and `curl` turn styles
-// need the outgoing and incoming page on screen at once as separate layers,
-// which the rigid column strip inside one iframe cannot provide. The View
-// Transitions API can: the browser rasterizes the outgoing page (overlays and
-// annotations included) as a snapshot that animates over the live, stationary
-// incoming page — an Apple Books style slide or curl. The choreography lives
-// in a document-level stylesheet because the ::view-transition pseudo tree
-// attaches to the document root, not to the paginator's shadow root.
+// Layered page-turn styles (readest#555). The `paper` and `curl`
+// turn styles need the outgoing and incoming page on screen at once as
+// separate layers, which the rigid column strip inside one iframe cannot
+// provide. The View Transitions API can: the browser rasterizes the
+// outgoing page (overlays and annotations included) as a snapshot that
+// animates over the live, stationary incoming page — a Kindle-like paper
+// drift or a corner curl. The choreography lives in a document-level
+// stylesheet because the ::view-transition pseudo tree attaches to the
+// document root, not to the paginator's shadow root.
+// (`slide` was retired: its flat travel is now paper's degraded Tauri
+// capture form only, never a View Transition style.)
 const VIEW_TRANSITION_CLASSES = [
-    'foliate-vt', 'foliate-vt-slide', 'foliate-vt-curl',
-    'foliate-vt-scrub',
+    'foliate-vt', 'foliate-vt-curl', 'foliate-vt-paper',
+    'foliate-vt-spread', 'foliate-vt-scrub', 'foliate-vt-dark',
     'foliate-vt-forward', 'foliate-vt-backward',
     'foliate-vt-left', 'foliate-vt-right',
     'foliate-vt-eat-left', 'foliate-vt-eat-right',
@@ -157,6 +160,17 @@ const LAYERED_EARLY_SAMPLE_INTERVAL_MS = 80
 const LAYERED_VERTICAL_REJECT_PX = 8
 const LAYERED_FALLBACK_CLAIM_PX = 24
 const LAYERED_FALLBACK_DOMINANCE = 1.5
+
+// Paper carries the layered gesture model (flat-at-claim origin, release
+// projection commit); curl keeps its own fold model. Only the on-screen
+// choreography differs.
+const paperLikeStyle = style => style === 'paper'
+
+// Live check (not a cached listener) so a changed OS setting applies to the
+// very next turn, and so tests can stub matchMedia per case.
+const prefersReducedMotion = () =>
+    typeof matchMedia === 'function'
+    && matchMedia('(prefers-reduced-motion: reduce)').matches
 
 const updateReleaseSample = (state, distance, time) => {
     const previous = state.releaseSamples.at(-1)
@@ -189,10 +203,10 @@ const getReleaseVelocity = state => {
 }
 
 // Release speed controls the remaining settle rate for both layered styles.
-// Slide can carry more momentum than the heavier curl.
+// Paper can carry more momentum than the heavier curl.
 const LAYERED_SETTLE_CONFIG = {
-    slide: { minSpeed: 0.2, maxSpeed: 1, maxRate: 2 },
     curl: { minSpeed: 0.3, maxSpeed: 1.5, maxRate: 1.5 },
+    paper: { minSpeed: 0.2, maxSpeed: 1, maxRate: 1.75 },
 }
 
 const layeredSettlePlaybackRate = (style, speed) => {
@@ -237,25 +251,6 @@ const injectViewTransitionStyles = () => {
         background: var(--foliate-vt-bg, Canvas);
         mix-blend-mode: normal;
     }
-    /* Slide: the moving page travels over the still page with a soft edge
-       shadow, like the Apple Books slide. Forward moves the outgoing
-       snapshot out on top; backward brings the incoming snapshot in on
-       top of the still outgoing page. */
-    .foliate-vt-slide.foliate-vt-forward::view-transition-old(foliate-turn) {
-        z-index: 1;
-        animation: foliate-turn-slide-out-left 300ms cubic-bezier(0.25, 0.46, 0.45, 0.94) both;
-        box-shadow: 0 0 24px rgba(0, 0, 0, 0.35);
-    }
-    .foliate-vt-slide.foliate-vt-forward.foliate-vt-right::view-transition-old(foliate-turn) {
-        animation-name: foliate-turn-slide-out-right;
-    }
-    .foliate-vt-slide.foliate-vt-backward::view-transition-new(foliate-turn) {
-        animation: foliate-turn-slide-in-left 300ms cubic-bezier(0.25, 0.46, 0.45, 0.94) both;
-        box-shadow: 0 0 24px rgba(0, 0, 0, 0.35);
-    }
-    .foliate-vt-slide.foliate-vt-backward.foliate-vt-right::view-transition-new(foliate-turn) {
-        animation-name: foliate-turn-slide-in-right;
-    }
     /* Finger-tracked turns map distance directly to animation time. Declare
        linear timing at the CSS source because some Android WebViews expose
        UA pseudo animations but reject KeyframeEffect.updateTiming(). */
@@ -263,10 +258,6 @@ const injectViewTransitionStyles = () => {
     .foliate-vt-scrub::view-transition-new(foliate-turn) {
         animation-timing-function: linear !important;
     }
-    @keyframes foliate-turn-slide-out-left { to { transform: translateX(-100%); } }
-    @keyframes foliate-turn-slide-out-right { to { transform: translateX(100%); } }
-    @keyframes foliate-turn-slide-in-left { from { transform: translateX(-100%); } }
-    @keyframes foliate-turn-slide-in-right { from { transform: translateX(100%); } }
     /* Curl: a fold line travels across the page, peeling it off the still
        page underneath like the Apple Books / Kindle curl. The fold is an
        oversized gradient mask slid across the OLD snapshot (mask-position is
@@ -311,6 +302,173 @@ const injectViewTransitionStyles = () => {
     @keyframes foliate-turn-curl-fold {
         from { --foliate-fold: 0%; }
         to { --foliate-fold: 118%; }
+    }
+    /* Paper (Glossa: Kindle-like drift, reading continues): the outgoing
+       page glides along the reading direction over the still incoming page,
+       with a slight mid-flight rotateY around the leading edge that
+       approximates the page-edge arc (a flat snapshot cannot bend; under
+       4deg text stays crisp and the turn ends flat).
+       The box-shadow opens from a thin seam into a soft spread and gathers
+       back to a line — the lifted page's shadow. A 2px border on the free
+       edge flashes a brighter paper tone then fades — the edge catching
+       light; painted on the snapshot's own box edge, it never bleeds onto
+       the revealed page. Theme variants ride custom properties so dark mode
+       softens the shadow and turns the light to a gentle gray. In a spread
+       the same swing reads as one leaf of an open book turning (the
+       foliate-vt-spread class lets the still layer settle slightly deeper,
+       matching the weight of the travelling sheet). No mask tricks: mask
+       and gradient overlays paint unreliably on VT pseudos and can even
+       override the snapshot's own image (verified blank), so all paper
+       cues stay as transform/shadow/border/filter. */
+    .foliate-vt-paper {
+        --paper-edge: rgba(255, 255, 255, 0.55);
+        --paper-edge-dim: rgba(255, 255, 255, 0.26);
+        --paper-shadow-line: rgba(0, 0, 0, 0.16);
+        --paper-shadow-spread: rgba(0, 0, 0, 0.22);
+    }
+    .foliate-vt-paper.foliate-vt-dark {
+        --paper-edge: rgba(255, 255, 255, 0.16);
+        --paper-edge-dim: rgba(255, 255, 255, 0.08);
+        --paper-shadow-line: rgba(0, 0, 0, 0.10);
+        --paper-shadow-spread: rgba(0, 0, 0, 0.15);
+    }
+    .foliate-vt-paper.foliate-vt-forward::view-transition-old(foliate-turn) {
+        z-index: 1;
+        animation: foliate-turn-paper-out-left 300ms cubic-bezier(0.3, 0, 0.3, 1) both;
+        border-right: 2px solid transparent;
+        transform-origin: left center;
+    }
+    .foliate-vt-paper.foliate-vt-forward.foliate-vt-right::view-transition-old(foliate-turn) {
+        animation-name: foliate-turn-paper-out-right;
+        border-right: none;
+        border-left: 2px solid transparent;
+        transform-origin: right center;
+    }
+    .foliate-vt-paper.foliate-vt-backward::view-transition-new(foliate-turn) {
+        animation: foliate-turn-paper-in-left 300ms cubic-bezier(0.3, 0, 0.3, 1) both;
+        border-right: 2px solid transparent;
+        transform-origin: left center;
+    }
+    .foliate-vt-paper.foliate-vt-backward.foliate-vt-right::view-transition-new(foliate-turn) {
+        animation-name: foliate-turn-paper-in-right;
+        border-right: none;
+        border-left: 2px solid transparent;
+        transform-origin: right center;
+    }
+    /* Spread turns swing the sheet around the spread centre while it
+       travels, so a two-column turn reads as one leaf of an open book
+       turning rather than a card sliding. foliate-vt-spread is set by
+       #vtSetup when the paginator shows two columns. */
+    .foliate-vt-paper.foliate-vt-spread.foliate-vt-forward::view-transition-old(foliate-turn) {
+        animation-name: foliate-turn-paper-spread-out-left;
+        transform-origin: 50% 50%;
+    }
+    .foliate-vt-paper.foliate-vt-spread.foliate-vt-forward.foliate-vt-right::view-transition-old(foliate-turn) {
+        animation-name: foliate-turn-paper-spread-out-right;
+        transform-origin: 50% 50%;
+    }
+    .foliate-vt-paper.foliate-vt-spread.foliate-vt-backward::view-transition-new(foliate-turn) {
+        animation-name: foliate-turn-paper-spread-in-left;
+        transform-origin: 50% 50%;
+    }
+    .foliate-vt-paper.foliate-vt-spread.foliate-vt-backward.foliate-vt-right::view-transition-new(foliate-turn) {
+        animation-name: foliate-turn-paper-spread-in-right;
+        transform-origin: 50% 50%;
+    }
+    /* The still page answers the moving one: the revealed page brightens
+       into place, the covered page sinks a shade. The step is small enough
+       to stay below notice on engines that never repaint the live layer. */
+    .foliate-vt-paper.foliate-vt-forward::view-transition-new(foliate-turn) {
+        animation: foliate-turn-paper-new-brighten 300ms cubic-bezier(0.3, 0, 0.3, 1) both;
+    }
+    .foliate-vt-paper.foliate-vt-backward::view-transition-old(foliate-turn) {
+        animation: foliate-turn-paper-old-dim 300ms cubic-bezier(0.3, 0, 0.3, 1) both;
+    }
+    .foliate-vt-paper.foliate-vt-spread.foliate-vt-forward::view-transition-new(foliate-turn) {
+        animation-name: foliate-turn-paper-new-brighten-spine;
+    }
+    .foliate-vt-paper.foliate-vt-spread.foliate-vt-backward::view-transition-old(foliate-turn) {
+        animation-name: foliate-turn-paper-old-dim-spine;
+    }
+    @keyframes foliate-turn-paper-out-left {
+        0% { transform: translateX(0) perspective(1400px) rotateY(0deg); box-shadow: 8px 0 12px -10px var(--paper-shadow-line); border-color: transparent; }
+        12% { border-color: var(--paper-edge); }
+        30% { transform: translateX(-31%) perspective(1400px) rotateY(-3.6deg); box-shadow: 26px 0 44px -18px var(--paper-shadow-spread); }
+        70% { transform: translateX(-72%) perspective(1400px) rotateY(-1.5deg); box-shadow: 16px 0 28px -14px var(--paper-shadow-spread); border-color: var(--paper-edge-dim); }
+        100% { transform: translateX(-100%) perspective(1400px) rotateY(0deg); box-shadow: 8px 0 12px -10px var(--paper-shadow-line); border-color: transparent; }
+    }
+    @keyframes foliate-turn-paper-out-right {
+        0% { transform: translateX(0) perspective(1400px) rotateY(0deg); box-shadow: -8px 0 12px -10px var(--paper-shadow-line); border-color: transparent; }
+        12% { border-color: var(--paper-edge); }
+        30% { transform: translateX(31%) perspective(1400px) rotateY(3.6deg); box-shadow: -26px 0 44px -18px var(--paper-shadow-spread); }
+        70% { transform: translateX(72%) perspective(1400px) rotateY(1.5deg); box-shadow: -16px 0 28px -14px var(--paper-shadow-spread); border-color: var(--paper-edge-dim); }
+        100% { transform: translateX(100%) perspective(1400px) rotateY(0deg); box-shadow: -8px 0 12px -10px var(--paper-shadow-line); border-color: transparent; }
+    }
+    @keyframes foliate-turn-paper-in-left {
+        0% { transform: translateX(-100%) perspective(1400px) rotateY(0deg); box-shadow: 8px 0 12px -10px var(--paper-shadow-line); border-color: transparent; }
+        18% { border-color: var(--paper-edge); }
+        38% { transform: translateX(-63%) perspective(1400px) rotateY(-3.6deg); box-shadow: 26px 0 44px -18px var(--paper-shadow-spread); }
+        75% { transform: translateX(-22%) perspective(1400px) rotateY(-1.5deg); box-shadow: 16px 0 28px -14px var(--paper-shadow-spread); border-color: var(--paper-edge-dim); }
+        100% { transform: translateX(0) perspective(1400px) rotateY(0deg); box-shadow: 8px 0 12px -10px var(--paper-shadow-line); border-color: transparent; }
+    }
+    @keyframes foliate-turn-paper-in-right {
+        0% { transform: translateX(100%) perspective(1400px) rotateY(0deg); box-shadow: -8px 0 12px -10px var(--paper-shadow-line); border-color: transparent; }
+        18% { border-color: var(--paper-edge); }
+        38% { transform: translateX(63%) perspective(1400px) rotateY(3.6deg); box-shadow: -26px 0 44px -18px var(--paper-shadow-spread); }
+        75% { transform: translateX(22%) perspective(1400px) rotateY(1.5deg); box-shadow: -16px 0 28px -14px var(--paper-shadow-spread); border-color: var(--paper-edge-dim); }
+        100% { transform: translateX(0) perspective(1400px) rotateY(0deg); box-shadow: -8px 0 12px -10px var(--paper-shadow-line); border-color: transparent; }
+    }
+    @keyframes foliate-turn-paper-new-brighten {
+        from { filter: brightness(0.985); }
+        to { filter: brightness(1); }
+    }
+    @keyframes foliate-turn-paper-old-dim {
+        from { filter: brightness(1); }
+        to { filter: brightness(0.985); }
+    }
+    /* Spread leaf turn: the sheet travels while swinging around the
+       spread centre, so a two-column spread pivots like one leaf of an
+       open book. The mid-flight rotateY peaks near ±7deg (still crisp for
+       a scrubbed snapshot; the turn ends flat), with a deeper travelling
+       shadow. */
+    @keyframes foliate-turn-paper-spread-out-left {
+        0% { transform: translateX(0) perspective(1400px) rotateY(0deg); box-shadow: 8px 0 12px -10px var(--paper-shadow-line); border-color: transparent; }
+        15% { border-color: var(--paper-edge); }
+        35% { transform: translateX(-38%) perspective(1400px) rotateY(-7deg); box-shadow: 30px 0 52px -16px var(--paper-shadow-spread); }
+        70% { transform: translateX(-74%) perspective(1400px) rotateY(-2.5deg); box-shadow: 18px 0 32px -14px var(--paper-shadow-spread); border-color: var(--paper-edge-dim); }
+        100% { transform: translateX(-100%) perspective(1400px) rotateY(0deg); box-shadow: 8px 0 12px -10px var(--paper-shadow-line); border-color: transparent; }
+    }
+    @keyframes foliate-turn-paper-spread-out-right {
+        0% { transform: translateX(0) perspective(1400px) rotateY(0deg); box-shadow: -8px 0 12px -10px var(--paper-shadow-line); border-color: transparent; }
+        15% { border-color: var(--paper-edge); }
+        35% { transform: translateX(38%) perspective(1400px) rotateY(7deg); box-shadow: -30px 0 52px -16px var(--paper-shadow-spread); }
+        70% { transform: translateX(74%) perspective(1400px) rotateY(2.5deg); box-shadow: -18px 0 32px -14px var(--paper-shadow-spread); border-color: var(--paper-edge-dim); }
+        100% { transform: translateX(100%) perspective(1400px) rotateY(0deg); box-shadow: -8px 0 12px -10px var(--paper-shadow-line); border-color: transparent; }
+    }
+    @keyframes foliate-turn-paper-spread-in-left {
+        0% { transform: translateX(-100%) perspective(1400px) rotateY(0deg); box-shadow: 8px 0 12px -10px var(--paper-shadow-line); border-color: transparent; }
+        20% { border-color: var(--paper-edge); }
+        42% { transform: translateX(-62%) perspective(1400px) rotateY(-7deg); box-shadow: 30px 0 52px -16px var(--paper-shadow-spread); }
+        78% { transform: translateX(-22%) perspective(1400px) rotateY(-2.5deg); box-shadow: 18px 0 32px -14px var(--paper-shadow-spread); border-color: var(--paper-edge-dim); }
+        100% { transform: translateX(0) perspective(1400px) rotateY(0deg); box-shadow: 8px 0 12px -10px var(--paper-shadow-line); border-color: transparent; }
+    }
+    @keyframes foliate-turn-paper-spread-in-right {
+        0% { transform: translateX(100%) perspective(1400px) rotateY(0deg); box-shadow: -8px 0 12px -10px var(--paper-shadow-line); border-color: transparent; }
+        20% { border-color: var(--paper-edge); }
+        42% { transform: translateX(62%) perspective(1400px) rotateY(7deg); box-shadow: -30px 0 52px -16px var(--paper-shadow-spread); }
+        78% { transform: translateX(22%) perspective(1400px) rotateY(2.5deg); box-shadow: -18px 0 32px -14px var(--paper-shadow-spread); border-color: var(--paper-edge-dim); }
+        100% { transform: translateX(0) perspective(1400px) rotateY(0deg); box-shadow: -8px 0 12px -10px var(--paper-shadow-line); border-color: transparent; }
+    }
+    /* The spread still layer answers with a slightly deeper settle than
+       the single-column brighten/dim, so the open book lands with the same
+       weight the turning leaf carried. */
+    @keyframes foliate-turn-paper-new-brighten-spine {
+        from { filter: brightness(0.975); }
+        to { filter: brightness(1); }
+    }
+    @keyframes foliate-turn-paper-old-dim-spine {
+        from { filter: brightness(1); }
+        to { filter: brightness(0.975); }
     }
     `
     document.head.append(style)
@@ -1998,13 +2156,19 @@ export class Paginator extends HTMLElement {
     get noContinuousScroll() {
         return this.scrolled && this.hasAttribute('no-continuous-scroll')
     }
-    // The layered turn styles (slide/curl, readest#555) rasterize the outgoing
-    // page with the View Transitions API; when the engine lacks it the caller
-    // falls through to the push/two-phase animations, so old WebViews keep
-    // working page turns.
+    // The layered turn styles (paper/curl, readest#555) rasterize the
+    // outgoing page with the View Transitions API; when the engine lacks it
+    // the caller falls through to the push/two-phase animations, so old
+    // WebViews keep working page turns. Reduced-motion users get no layered
+    // turn (and no animation at all via the #scrollTo gate): instant cuts.
     get #layeredTurn() {
-        const style = this.getAttribute('turn-style')
-        return (style === 'slide' || style === 'curl')
+        if (prefersReducedMotion()) return null
+        const raw = this.getAttribute('turn-style')
+        // Retired `slide` settings (stored or synced before its removal)
+        // degrade to paper; the flat travel survives only as paper's Tauri
+        // capture form.
+        const style = raw === 'slide' ? 'paper' : raw
+        return (style === 'curl' || style === 'paper')
             && typeof document.startViewTransition === 'function'
             ? style : null
     }
@@ -2118,7 +2282,8 @@ export class Paginator extends HTMLElement {
         const pages = this.#renderedPages
         let page
         if (this.#vertical && useHorizontal && !this.#layeredTurn
-            && this.hasAttribute('animated') && !this.hasAttribute('eink')) {
+            && this.hasAttribute('animated') && !this.hasAttribute('eink')
+            && !prefersReducedMotion()) {
             // Drag-follow gestures on vertical books (readest#624): the views
             // tracked the finger, so judge the turn like a paged carousel by
             // where the drag ended plus the release flick, instead of the
@@ -2148,7 +2313,7 @@ export class Paginator extends HTMLElement {
             // finger; judge the whole gesture by displacement (avgVelocity)
             // like the eink path.
             const snapping = this.hasAttribute('animated') && !this.hasAttribute('eink')
-                && !this.#vertical && !this.#layeredTurn
+                && !this.#vertical && !this.#layeredTurn && !prefersReducedMotion()
             // Drag-follow releases are judged by the release flick, so their
             // alignment uses the flick (last-sample) velocities. Displacement-
             // judged releases weigh the WHOLE gesture and their alignment must
@@ -2324,7 +2489,8 @@ export class Paginator extends HTMLElement {
         state.dt += dt
         updateReleaseSample(state, state.dx, e.timeStamp)
         this.#touchScrolled = true
-        if (!this.hasAttribute('animated') || this.hasAttribute('eink')) return
+        if (!this.hasAttribute('animated') || this.hasAttribute('eink')
+            || prefersReducedMotion()) return
         // Layered turn styles track the finger by scrubbing a paused view
         // transition: the outgoing snapshot follows the drag over the still
         // incoming page, then commits or reverses on release.
@@ -2341,7 +2507,7 @@ export class Paginator extends HTMLElement {
                 // still contributes to release intent below, but no longer
                 // appears as a first-frame jump. Curl preserves its existing
                 // touchstart-relative fold.
-                const visualDistance = drag.style === 'slide'
+                const visualDistance = paperLikeStyle(drag.style)
                     ? totalDistance - drag.visualOriginDistance
                     : totalDistance
                 drag.progress = Math.max(0, Math.min(1,
@@ -2378,6 +2544,13 @@ export class Paginator extends HTMLElement {
             forward ? 'foliate-vt-forward' : 'foliate-vt-backward',
             `foliate-vt-${side}`, `foliate-vt-eat-${eatSide}`]
         if (scrubbing) classes.push('foliate-vt-scrub')
+        // A two-column paginator turns as an open book: one spread-wide
+        // snapshot pivots around the gutter instead of sliding flat. The
+        // gesture model stays projection-based; only the pivot differs, so
+        // scrubbed drags reuse the same progress mapping. Column count is
+        // layout state (not scroll position), safe to read mid-turn.
+        if (style === 'paper' && !this.scrolled && this.columnCount > 1)
+            classes.push('foliate-vt-spread')
         let namedHost = this
         while (namedHost.getRootNode() instanceof ShadowRoot) {
             namedHost = namedHost.getRootNode().host
@@ -2394,6 +2567,14 @@ export class Paginator extends HTMLElement {
                 .getPropertyValue('--theme-bg-color').trim()
             : ''
         html.style.setProperty('--foliate-vt-bg', themeBg || 'Canvas')
+        // Dark themes soften the paper turn's shadow and edge light. The app
+        // marks the book document with a `theme-dark` body class; fall back
+        // to the iframe's computed color-scheme for hosts that only set that.
+        const dark = doc?.body?.classList.contains('theme-dark')
+            ?? (doc?.documentElement
+                && doc.defaultView.getComputedStyle(doc.documentElement)
+                    .colorScheme === 'dark')
+        if (dark) classes.push('foliate-vt-dark')
         html.classList.remove(...VIEW_TRANSITION_CLASSES)
         html.classList.add(...classes)
         return namedHost
@@ -2535,7 +2716,7 @@ export class Paginator extends HTMLElement {
         const drag = {
             transition, offset, startPosition, forward,
             style, progress: 0, anims: null,
-            visualOriginDistance: style === 'slide'
+            visualOriginDistance: paperLikeStyle(style)
                 ? Math.max(0, forward ? along : -along) : 0,
             // Progress must use the width of the actual named snapshot. The
             // inner content container can be narrower because of page margins;
@@ -2745,8 +2926,8 @@ export class Paginator extends HTMLElement {
             this.#vtDrag = null
             // Keep Curl's established whole-gesture guard exactly as-is;
             // Slide uses the actual lift-off point required by its projection.
-            const gestureDx = drag.style === 'slide' ? releaseDx : (state?.dx ?? 0)
-            const gestureDy = drag.style === 'slide' ? releaseDy : (state?.dy ?? 0)
+            const gestureDx = paperLikeStyle(drag.style) ? releaseDx : (state?.dx ?? 0)
+            const gestureDy = paperLikeStyle(drag.style) ? releaseDy : (state?.dy ?? 0)
             const gestureAligned = state
                 ? Math.abs(gestureDx) > Math.abs(gestureDy) : true
             const alongV = this.#rtl ? -(state?.vx ?? 0) : (state?.vx ?? 0)
@@ -2763,14 +2944,14 @@ export class Paginator extends HTMLElement {
                 + progressVelocity * SLIDE_RELEASE_PROJECTION_MS / drag.width
             const curlFlick = Math.abs(alongV) > 0.3
                 ? Math.sign(alongV) * (drag.forward ? 1 : -1) : 0
-            const commit = gestureAligned && (drag.style === 'slide'
+            const commit = gestureAligned && (paperLikeStyle(drag.style)
                 ? projectedProgress > 0.5
                 : curlFlick > 0 ? true : curlFlick < 0 ? false : drag.progress > 0.5)
             // Do not scrub a gesture that ended vertically: flashing its final
             // horizontal component here would defeat the intent guard. A valid
             // Slide release settles from the actual lift-off position; Curl's
             // existing progress and commit mapping remain unchanged.
-            if (gestureAligned && drag.style === 'slide') {
+            if (gestureAligned && paperLikeStyle(drag.style)) {
                 drag.progress = releaseVisualProgress
                 this.#vtDragScrub(drag)
             }
@@ -2897,7 +3078,8 @@ export class Paginator extends HTMLElement {
         }
         // FIXME: vertical-rl only, not -lr
         if (this.scrolled && this.#vertical) offset = -offset
-        if ((reason === 'snap' || smooth) && this.hasAttribute('animated') && !this.hasAttribute('eink')) {
+        if ((reason === 'snap' || smooth) && this.hasAttribute('animated')
+            && !this.hasAttribute('eink') && !prefersReducedMotion()) {
             // Layered turn styles: snapshot the outgoing page and animate it
             // over the live, stationary incoming page (readest#555). Works
             // for every writing mode since the snapshot is axis-agnostic —

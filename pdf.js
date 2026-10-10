@@ -1,4 +1,5 @@
 const pdfjsPath = path => `/vendor/pdfjs/${path}`
+import * as CFI from './epubcfi.js'
 
 import '@pdfjs/pdf.min.mjs'
 const pdfjsLib = globalThis.pdfjsLib
@@ -378,29 +379,55 @@ const renderPage = async (page, getImageBlob) => {
     return { src, data, onZoom }
 }
 
-const makeTOCItem = async (item, pdf) => {
-    let pageIndex = undefined
+const resolveDestination = async (value, pdf) => {
+    try {
+        const dest = typeof value === 'string' ? await pdf.getDestination(value) : value
+        if (!Array.isArray(dest) || dest[0] == null) return
+        // Explicit destinations can carry a zero-based page number, including 0.
+        const index = Number.isInteger(dest[0]) ? dest[0] : await pdf.getPageIndex(dest[0])
+        if (Number.isInteger(index) && index >= 0 && index < pdf.numPages)
+            return { index, dest }
+    } catch { /* Invalid links must not break the reading session. */ }
+}
 
-    if (item.dest) {
-        try {
-            const dest = typeof item.dest === 'string'
-                ? await pdf.getDestination(item.dest)
-                : item.dest
-            if (dest?.[0]) {
-                pageIndex = await pdf.getPageIndex(dest[0])
-            }
-        } catch (e) {
-            console.warn('Failed to get page index for TOC item:', item.title, e)
-        }
-    }
-
+const makeTOCItem = async (item, resolve, destinations) => {
+    const target = await resolve(item.dest)
+    const href = target ? JSON.stringify(item.dest) : ''
+    if (href) destinations.set(href, target)
     return {
         label: item.title,
-        href: item.dest ? JSON.stringify(item.dest) : '',
-        index: pageIndex,
+        href,
+        index: target?.index,
+        cfi: target ? CFI.fake.fromIndex(target.index) : undefined,
         subitems: item.items?.length
-            ? await Promise.all(item.items.map(i => makeTOCItem(i, pdf)))
+            ? await Promise.all(item.items.map(i => makeTOCItem(i, resolve, destinations)))
             : null,
+    }
+}
+
+const destinationAnchor = (page, dest) => {
+    const viewport = page.getViewport({ scale: 1 })
+    const mode = dest[1]?.name
+    const left = mode === 'XYZ' || mode === 'FitR' || mode === 'FitV' || mode === 'FitBV'
+        ? dest[2] : null
+    const top = mode === 'XYZ' ? dest[3] : mode === 'FitR' ? dest[5]
+        : mode === 'FitH' || mode === 'FitBH' ? dest[2] : null
+    if (!Number.isFinite(top) && !Number.isFinite(left)) return
+    const [x, y] = viewport.convertToViewportPoint(left ?? 0, top ?? viewport.viewBox[3])
+    return doc => {
+        const layer = doc.querySelector('.textLayer')
+        const scale = parseFloat(doc.documentElement.style.getPropertyValue('--total-scale-factor')) || 1
+        let closest, distance = Infinity
+        for (const span of layer?.querySelectorAll('span') ?? []) {
+            if (!span.textContent) continue
+            const rect = span.getBoundingClientRect()
+            const d = Math.abs(rect.top - y * scale) + Math.abs(rect.left - x * scale) * 0.1
+            if (d < distance) { closest = span; distance = d }
+        }
+        if (!closest) return Math.max(0, Math.min(1, y / viewport.height))
+        const range = doc.createRange()
+        range.selectNodeContents(closest)
+        return range
     }
 }
 
@@ -502,8 +529,29 @@ export const makePDF = async file => {
     const calibreSeries = parseCalibreSeriesFromXMP(metadata?.getRaw?.())
     if (calibreSeries) book.metadata.belongsTo = { series: calibreSeries }
 
+    const destinations = new Map()
+    const resolve = value => resolveDestination(value, pdf)
     const outline = await pdf.getOutline()
-    book.toc = outline ? await Promise.all(outline.map(item => makeTOCItem(item, pdf))) : null
+    book.toc = outline?.length
+        ? await Promise.all(outline.map(item => makeTOCItem(item, resolve, destinations))) : []
+    const labels = await pdf.getPageLabels?.()
+    book.pageList = Array.from({ length: pdf.numPages }, (_, index) => {
+        const dest = [index, { name: 'Fit' }]
+        const href = JSON.stringify(dest)
+        destinations.set(href, { index, dest })
+        return { id: index, label: labels?.[index] ?? String(index + 1),
+            href, index, cfi: CFI.fake.fromIndex(index) }
+    })
+    // Without an embedded outline, expose honest page navigation in the TOC.
+    if (!book.toc.length) book.toc = book.pageList.map(item => ({ ...item }))
+    let tocID = 0
+    const assignID = items => {
+        for (const item of items) {
+            item.id = tocID++
+            if (item.subitems) assignID(item.subitems)
+        }
+    }
+    assignID(book.toc)
 
     const cache = new Map()
     const pageCache = new Map()
@@ -592,25 +640,17 @@ export const makePDF = async file => {
     }))
     book.isExternal = uri => /^\w+:/i.test(uri)
     book.resolveHref = async href => {
-        const parsed = JSON.parse(href)
-        const dest = typeof parsed === 'string'
-            ? await pdf.getDestination(parsed) : parsed
-        const index = await pdf.getPageIndex(dest[0])
-        return { index }
-    }
-    book.splitTOCHref = async href => {
-        if (!href) return [null, null]
-        const parsed = JSON.parse(href)
-        const dest = typeof parsed === 'string'
-            ? await pdf.getDestination(parsed) : parsed
-        try {
-            const index = await pdf.getPageIndex(dest[0])
-            return [index, null]
-        } catch (e) {
-            console.warn('Error getting page index for href', href, e)
-            return [null, null]
+        let target = destinations.get(href)
+        if (!target) {
+            try { target = await resolve(JSON.parse(href)) }
+            catch { return }
         }
+        if (!target) return
+        const { index, dest } = target
+        const page = await getPage(index)
+        return { index, anchor: destinationAnchor(page, dest) }
     }
+    book.splitTOCHref = href => [destinations.get(href)?.index ?? null, null]
     book.getTOCFragment = doc => doc.documentElement
     book.getCover = async () => renderPage(await pdf.getPage(1), true)
     book.destroy = () => {

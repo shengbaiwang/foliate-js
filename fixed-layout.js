@@ -246,6 +246,7 @@ export class FixedLayout extends HTMLElement {
     #scrollMaxConcurrent = 3
     #scrollLoadingCount = 0
     #scrollIdleTimer = null
+    #paginatedLocationTimer = null
     #scrollCurrentIndex = -1
     // True while the host is actively scrolling. Pages load interactive only
     // when idle so a page that finishes loading mid-scroll can't flip its iframe
@@ -423,6 +424,13 @@ export class FixedLayout extends HTMLElement {
         }`)
 
         this.#observer.observe(this)
+        this.addEventListener('scroll', () => {
+            if (this.#scrollMode) return
+            clearTimeout(this.#paginatedLocationTimer)
+            this.#paginatedLocationTimer = setTimeout(() => {
+                if (!this.#scrollMode && this.index >= 0) this.#reportLocation('scroll')
+            }, 150)
+        })
     }
     attributeChangedCallback(name, _, value) {
         switch (name) {
@@ -1001,7 +1009,16 @@ export class FixedLayout extends HTMLElement {
             }
         })
     }
-    async #loadScrollPage(pageData) {
+    #loadScrollPage(pageData) {
+        if (pageData.loadingPromise) return pageData.loadingPromise
+        const promise = this.#loadScrollPageContent(pageData)
+        pageData.loadingPromise = promise
+        promise.finally(() => {
+            if (pageData.loadingPromise === promise) pageData.loadingPromise = null
+        })
+        return promise
+    }
+    async #loadScrollPageContent(pageData) {
         if (pageData.state !== 'idle') return
         pageData.state = 'loading'
         this.#scrollLoadingCount++
@@ -1038,7 +1055,7 @@ export class FixedLayout extends HTMLElement {
                 pageData.vpWidth = frame.width
                 pageData.vpHeight = frame.height
             }
-            this.#renderScrollPage(pageData)
+            await this.#renderScrollPage(pageData)
             this.#restoreScrollModeAnchor(scrollAnchor)
 
             // Make the page interactive right away when idle so text selection
@@ -1152,7 +1169,11 @@ export class FixedLayout extends HTMLElement {
             : (hostWidth / vw) * this.#scaleFactor
 
         if (frame.onZoom) {
-            frame.onZoom({ doc: frame.iframe.contentDocument, scale, pageColors: this.#pageColors })
+            frame.renderPromise = Promise.resolve(frame.onZoom({
+                doc: frame.iframe.contentDocument, scale, pageColors: this.#pageColors,
+            })).then(() => {
+                if (pageData.frame === frame) this.#refreshOverlayerForFrame(frame)
+            })
             Object.assign(frame.iframe.style, {
                 width: `${vw * scale}px`,
                 height: `${vh * scale}px`,
@@ -1188,6 +1209,7 @@ export class FixedLayout extends HTMLElement {
             applyOverlayerViewBox(frame, overlayer)
             overlayer.redraw()
         }
+        return frame.renderPromise
     }
     #getScrollIndex() {
         if (!this.#scrollPages.length) return -1
@@ -1217,7 +1239,7 @@ export class FixedLayout extends HTMLElement {
         if (index < 0) return
         this.#scrollCurrentIndex = index
         this.dispatchEvent(new CustomEvent('relocate', { detail:
-            { reason: 'scroll', range: null, index, fraction: 0, size: 1 } }))
+            { reason: 'scroll', range: this.#getVisibleRange(index), index, fraction: 0, size: 1 } }))
     }
     #goLeft() {
         if (this.#center || this.#left?.blank) return
@@ -1351,7 +1373,36 @@ export class FixedLayout extends HTMLElement {
     }
     #reportLocation(reason) {
         this.dispatchEvent(new CustomEvent('relocate', { detail:
-            { reason, range: null, index: this.index, fraction: 0, size: 1 } }))
+            { reason, range: this.#getVisibleRange(this.index), index: this.index, fraction: 0, size: 1 } }))
+    }
+    #getVisibleRange(index) {
+        const doc = this.getContents().find(content => content.index === index)?.doc
+        const iframe = doc?.defaultView?.frameElement
+        if (!doc || !iframe) return null
+        // Text-layer only: PDF popup contents are not book text. Non-PDF fixed
+        // layout retains the body as its selectable root.
+        const root = doc.querySelector('.textLayer') ?? doc.body
+        const hostRect = this.getBoundingClientRect()
+        const frameRect = iframe.getBoundingClientRect()
+        const scale = frameRect.width / (doc.documentElement.clientWidth || frameRect.width) || 1
+        const walker = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT)
+        let first, last
+        for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+            if (!node.textContent?.trim()) continue
+            const range = doc.createRange()
+            range.selectNodeContents(node)
+            const visible = Array.from(range.getClientRects?.() ?? []).some(rect =>
+                frameRect.top + rect.bottom * scale > hostRect.top
+                && frameRect.top + rect.top * scale < hostRect.bottom
+                && frameRect.left + rect.right * scale > hostRect.left
+                && frameRect.left + rect.left * scale < hostRect.right)
+            if (visible) { first ??= node; last = node }
+        }
+        if (!first) return null
+        const range = doc.createRange()
+        range.setStart(first, 0)
+        range.setEnd(last, last.textContent.length)
+        return range
     }
     getSpreadOf(section) {
         const spreads = this.#spreads
@@ -1365,7 +1416,9 @@ export class FixedLayout extends HTMLElement {
     async goToSpread(index, side, reason) {
         if (index < 0 || index > this.#spreads.length - 1) return
         if (index === this.#index) {
-            this.#render(side)
+            if (side) this.#side = side
+            await Promise.all(this.#render(side))
+            this.#reportLocation(reason)
             return
         }
         this.#index = index
@@ -1566,12 +1619,20 @@ export class FixedLayout extends HTMLElement {
     }
     async goTo(target) {
         const resolved = await target
+        if (!resolved || !this.book.sections[resolved.index]) return
         if (this.#scrollMode) {
             const page = this.#scrollPages[resolved.index]
             if (page) {
                 page.el.scrollIntoView(
                     this.#scrollHorizontal ? { inline: 'start', block: 'nearest' } : undefined)
                 this.#scrollCurrentIndex = resolved.index
+                await this.#loadScrollPage(page)
+                await page.frame?.renderPromise
+                const doc = page.frame?.iframe?.contentDocument
+                const anchor = typeof resolved.anchor === 'function' && doc
+                    ? resolved.anchor(doc) : resolved.anchor
+                if (anchor != null) this.scrollToAnchor(anchor)
+                this.#reportLocation('navigation')
             }
             return
         }
@@ -1580,6 +1641,31 @@ export class FixedLayout extends HTMLElement {
         if (!section) return
         const { index, side } = this.getSpreadOf(section)
         await this.goToSpread(index, side)
+        const doc = this.getContents().find(content => content.index === resolved.index)?.doc
+        const anchor = typeof resolved.anchor === 'function' && doc
+            ? resolved.anchor(doc) : resolved.anchor
+        if (anchor != null) this.scrollToAnchor(anchor)
+        this.#reportLocation('navigation')
+    }
+    scrollToAnchor(anchor) {
+        const doc = anchor?.startContainer?.ownerDocument ?? anchor?.ownerDocument
+            ?? this.getContents().find(content => content.index === this.index)?.doc
+        const iframe = doc?.defaultView?.frameElement
+        if (!iframe) return
+        const frameRect = iframe.getBoundingClientRect()
+        const hostRect = this.getBoundingClientRect()
+        const scale = frameRect.width / (doc.documentElement.clientWidth || frameRect.width) || 1
+        let rect = typeof anchor === 'number'
+            ? { top: doc.documentElement.scrollHeight * anchor, left: 0, right: 0 }
+            : anchor.getBoundingClientRect?.()
+        if (rect?.height === 0 && anchor?.startContainer?.nodeType === Node.ELEMENT_NODE)
+            rect = anchor.startContainer.getBoundingClientRect?.() ?? rect
+        if (!rect) return
+        this.scrollTop += frameRect.top + rect.top * scale - hostRect.top - 24
+        const left = frameRect.left + rect.left * scale
+        const right = frameRect.left + rect.right * scale
+        if (left < hostRect.left || right > hostRect.right)
+            this.scrollLeft += left - hostRect.left - 24
     }
     async next(distance) {
         if (this.#scrollMode) {
@@ -1774,6 +1860,7 @@ export class FixedLayout extends HTMLElement {
         return 'width'
     }
     destroy() {
+        clearTimeout(this.#paginatedLocationTimer)
         this.#observer.unobserve(this)
         if (this.#scrollMode) {
             this.removeEventListener('scroll', this.#handleScrollEvent)
