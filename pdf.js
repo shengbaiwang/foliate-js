@@ -2,6 +2,7 @@ const pdfjsPath = path => `/vendor/pdfjs/${path}`
 import * as CFI from './epubcfi.js'
 
 import '@pdfjs/pdf.min.mjs'
+import { appendOCR, ocrText } from './pdf-ocr.js'
 const pdfjsLib = globalThis.pdfjsLib
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsPath('pdf.worker.min.mjs')
 
@@ -191,7 +192,7 @@ const getRenderDpr = (page, zoom) => {
     return Math.max(1, dpr)
 }
 
-const render = async (page, doc, zoom, pageColors) => {
+const render = async (page, doc, zoom, pageColors, ocr) => {
     if (!doc) return
 
     // Increment generation to invalidate any in-progress render for this doc
@@ -284,6 +285,7 @@ const render = async (page, doc, zoom, pageColors) => {
         container, viewport: displayViewport,
     })
     await textLayer.render()
+    appendOCR(container, ocr, displayViewport)
 
     // Bail out if superseded after async text layer render
     if (renderGenerations.get(doc) !== generation) return
@@ -334,7 +336,7 @@ const render = async (page, doc, zoom, pageColors) => {
     })
 }
 
-const renderPage = async (page, getImageBlob) => {
+const renderPage = async (page, getImageBlob, ocr = null) => {
     const viewport = page.getViewport({ scale: 1 })
     if (getImageBlob) {
         const canvas = document.createElement('canvas')
@@ -375,7 +377,7 @@ const renderPage = async (page, getImageBlob) => {
         <div class="annotationLayer"></div>
     `
     const src = URL.createObjectURL(new Blob([data], { type: 'text/html' }))
-    const onZoom = ({ doc, scale, pageColors }) => render(page, doc, scale, pageColors)
+    const onZoom = ({ doc, scale, pageColors }) => render(page, doc, scale, pageColors, ocr)
     return { src, data, onZoom }
 }
 
@@ -477,7 +479,7 @@ const parseCalibreSeriesFromXMP = raw => {
 // WebView's heap, crashing on 50 MB+ PDFs (readest #3470). Throttle here.
 const MAX_CONCURRENT_RANGES = 6
 
-export const makePDF = async file => {
+export const makePDF = async (file, { loadOCR } = {}) => {
     const transport = new pdfjsLib.PDFDataRangeTransport(file.size, [])
     // Bound the concurrent range reads instead of dispatching them all at once.
     let active = 0
@@ -586,7 +588,7 @@ export const makePDF = async file => {
                 cache.set(i, cached)
                 return cached
             }
-            const url = await renderPage(await getPage(i))
+            const url = await renderPage(await getPage(i), false, await loadOCR?.(i))
             cache.set(i, url)
 
             // Evict oldest render results when over limit
@@ -634,11 +636,17 @@ export const makePDF = async file => {
                     }
                 }
             }
+            appendOCR(textLayer, await loadOCR?.(i), page.getViewport({ scale: 1 }))
             return doc
         },
         size: 1000,
     }))
     book.isExternal = uri => /^\w+:/i.test(uri)
+    book.getPDFText = async index => {
+        const content = await (await getPage(index)).getTextContent()
+        const native = content.items.map(item => (item.str ?? '') + (item.hasEOL ? '\n' : ' ')).join('')
+        return native.trim() ? native : ocrText(await loadOCR?.(index))
+    }
     book.resolveHref = async href => {
         let target = destinations.get(href)
         if (!target) {
