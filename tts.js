@@ -220,7 +220,7 @@ function* getBlocks(doc, nodeFilter) {
     // For PDF text layers, yield sentence-level blocks
     const textLayer = root.querySelector?.('.textLayer')
     if (textLayer) {
-        yield* getPDFSentenceBlocks(doc, textLayer)
+        yield* getPDFSentenceBlocks(doc, textLayer.querySelector('[data-pdf-ocr-text]') ?? textLayer)
         return
     }
 

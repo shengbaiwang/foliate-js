@@ -75,8 +75,9 @@ export const scrollGapToCss = (value) => {
 // flies past — that thrashes the main thread and spikes WebView memory
 // (readest#4795), the same pressure the PDF range-read throttle guards against
 // (readest#3470).
+/** @param {{ pages: Array<{index: number, state: string, visible: boolean}>, currentIndex: number, maxLoaded: number, maxConcurrent: number, loadingCount: number, pinnedIndices?: number[] }} options */
 export const planScrollModePages = ({
-    pages, currentIndex, maxLoaded, maxConcurrent, loadingCount,
+    pages, currentIndex, maxLoaded, maxConcurrent, loadingCount, pinnedIndices = [],
 }) => {
     const dist = page => Math.abs(page.index - currentIndex)
 
@@ -89,7 +90,7 @@ export const planScrollModePages = ({
 
     const loaded = pages.filter(page => page.state === 'loaded')
     const evict = loaded.length <= maxLoaded ? [] : loaded
-        .filter(page => !page.visible)
+        .filter(page => !page.visible && !pinnedIndices.includes(page.index))
         .sort((a, b) => dist(b) - dist(a))
         .slice(0, loaded.length - maxLoaded)
         .map(page => page.index)
@@ -221,6 +222,7 @@ export class FixedLayout extends HTMLElement {
     #isOverflowY = false
     #preloadCache = new Map()
     #prerenderedSpreads = new Map()
+    #spreadLoads = new Map()
     #spreadAccessTime = new Map()
     #maxConcurrentPreloads = 1
     #numPrerenderedSpreads = 1
@@ -240,6 +242,7 @@ export class FixedLayout extends HTMLElement {
     // page box × devicePixelRatio (~7 MB at dpr 3), so this is the dominant
     // memory ceiling — keep it just above the visible window plus preload lead.
     #scrollMaxLoaded = 12
+    #selectionPages = []
     // Cap on concurrent page loads. A fast fling crosses many pages; without a
     // bound it would start a full-resolution render for every one, thrashing the
     // main thread and spiking memory. Nearest-to-viewport pages load first.
@@ -321,7 +324,10 @@ export class FixedLayout extends HTMLElement {
         if (Math.abs(restoredPos - this.#scrollContentPos()) > 0.5) {
             this.#setScrollContentPos(restoredPos)
         }
-        this.#scrollCurrentIndex = anchor.index
+        // The preserved top-edge anchor can belong to the preceding page.
+        // Current-page reporting consistently follows the viewport centre,
+        // including when a neighbour finishes loading without moving the view.
+        this.#scrollCurrentIndex = this.#getScrollIndex()
     }
     // Length of the viewport along the scroll axis.
     #scrollViewLength() {
@@ -436,7 +442,7 @@ export class FixedLayout extends HTMLElement {
         switch (name) {
             case 'zoom':
                 this.#zoom = value !== 'fit-width' && value !== 'fit-page'
-                    ? parseFloat(value) : value
+                    ? (value === 'original-size' ? 1 : parseFloat(value)) : value
                 this.#render()
                 break
             case 'scale-factor':
@@ -514,6 +520,10 @@ export class FixedLayout extends HTMLElement {
         return new Promise(resolve => {
             iframe.addEventListener('load', () => {
                 const doc = iframe.contentDocument
+                doc.addEventListener('pdf-text-ready', () => {
+                    const frame = { iframe, onZoom, element }
+                    this.#refreshOverlayerForFrame(frame)
+                })
                 iframe.dataset.sectionIndex = index
                 this.dispatchEvent(new CustomEvent('load', { detail: { doc, index } }))
                 const { width, height } = getViewport(doc, this.defaultViewport)
@@ -868,6 +878,7 @@ export class FixedLayout extends HTMLElement {
             maxLoaded: this.#scrollMaxLoaded,
             maxConcurrent: this.#scrollMaxConcurrent,
             loadingCount: this.#scrollLoadingCount,
+            pinnedIndices: this.#selectionPages,
         })
         for (const index of evict) this.#teardownScrollPage(this.#scrollPages[index])
         for (const index of load) this.#loadScrollPage(this.#scrollPages[index])
@@ -902,7 +913,7 @@ export class FixedLayout extends HTMLElement {
         this.scrollBy({ left: delta.left, behavior: 'auto' })
     }
     #setScrollIframeInteraction(enabled) {
-        const value = enabled ? 'auto' : ''
+        const value = enabled || this.#selectionPages.length ? 'auto' : ''
         for (const page of this.#scrollPages) {
             if (page.frame?.iframe) {
                 page.frame.iframe.style.pointerEvents = value
@@ -992,6 +1003,10 @@ export class FixedLayout extends HTMLElement {
         return new Promise(resolve => {
             iframe.addEventListener('load', () => {
                 const doc = iframe.contentDocument
+                doc.addEventListener('pdf-text-ready', () => {
+                    const frame = { iframe, onZoom, element }
+                    this.#refreshOverlayerForFrame(frame)
+                })
                 iframe.dataset.sectionIndex = pageData.index
                 this.dispatchEvent(new CustomEvent('load', { detail: { doc, index: pageData.index } }))
                 const { width, height } = getViewport(doc, this.defaultViewport)
@@ -1055,8 +1070,13 @@ export class FixedLayout extends HTMLElement {
                 pageData.vpWidth = frame.width
                 pageData.vpHeight = frame.height
             }
-            await this.#renderScrollPage(pageData)
+            const rendered = this.#renderScrollPage(pageData)
+            // Layout changes synchronously; restore before drawing yields so a
+            // completed neighbour cannot overwrite a newer search/user scroll.
             this.#restoreScrollModeAnchor(scrollAnchor)
+            await rendered
+            if (this.#scrollLoadGen.get(pageData.index) !== gen
+                || pageData.frame !== frame || !this.#scrollMode) return
 
             // Make the page interactive right away when idle so text selection
             // and taps work without first scrolling. While scrolling, leave it
@@ -1132,6 +1152,16 @@ export class FixedLayout extends HTMLElement {
         pageData.frame = null
         pageData.state = 'idle'
     }
+    #scrollPageScale(width, height, host = this.getBoundingClientRect()) {
+        const base = typeof this.#zoom === 'number' && Number.isFinite(this.#zoom)
+            ? this.#zoom
+            : this.#zoom === 'fit-page'
+                ? Math.min(host.width / width, host.height / height)
+                : this.#zoom === 'fit-width'
+                    ? host.width / width
+                    : this.#scrollHorizontal ? host.height / height : host.width / width
+        return base * this.#scaleFactor
+    }
     #renderScrollMode() {
         const { width: hostWidth, height: hostHeight } = this.getBoundingClientRect()
         if (!(this.#scrollHorizontal ? hostHeight : hostWidth)) return
@@ -1144,9 +1174,7 @@ export class FixedLayout extends HTMLElement {
         const pinchAnchor = this.#pinchAnchor
         const scrollAnchor = pinchAnchor ? null : this.#captureScrollModeAnchor()
         for (const page of this.#scrollPages) {
-            const scale = this.#scrollHorizontal
-                ? (hostHeight / page.vpHeight) * this.#scaleFactor
-                : (hostWidth / page.vpWidth) * this.#scaleFactor
+            const scale = this.#scrollPageScale(page.vpWidth, page.vpHeight, { width: hostWidth, height: hostHeight })
             page.el.style.width = `${page.vpWidth * scale}px`
             page.el.style.height = `${page.vpHeight * scale}px`
             if (page.state === 'loaded' && page.frame) {
@@ -1164,9 +1192,7 @@ export class FixedLayout extends HTMLElement {
         const { width: hostWidth, height: hostHeight } = this.getBoundingClientRect()
         if (!(this.#scrollHorizontal ? hostHeight : hostWidth) || !pageData.frame) return
         const { vpWidth: vw, vpHeight: vh, frame } = pageData
-        const scale = this.#scrollHorizontal
-            ? (hostHeight / vh) * this.#scaleFactor
-            : (hostWidth / vw) * this.#scaleFactor
+        const scale = this.#scrollPageScale(vw, vh)
 
         if (frame.onZoom) {
             frame.renderPromise = Promise.resolve(frame.onZoom({
@@ -1339,6 +1365,10 @@ export class FixedLayout extends HTMLElement {
             ? spread.left ?? spread.right : spread.right ?? spread.left)
         return this.book.sections.indexOf(section)
     }
+    get scale() {
+        const page = this.#scrollMode && this.#scrollPages[this.index]
+        return page ? this.#scrollPageScale(page.vpWidth, page.vpHeight) : this.#totalScaleFactor
+    }
     get pageColors() {
         return this.#pageColors
     }
@@ -1354,6 +1384,25 @@ export class FixedLayout extends HTMLElement {
     }
     set scrollLocked(value) {
         this.#scrollLocked = value
+    }
+    setSelectionPages(indices = []) {
+        this.#selectionPages = indices.slice(0, 24)
+        this.#setScrollIframeInteraction(!this.#scrolling)
+        if (this.#scrollMode) this.#scheduleScrollPages()
+    }
+    async loadSelectionPage(index) {
+        // Selection may wait for a neighbouring page, but must not navigate
+        // there before its text is ready. Only the bounded pinned set can load.
+        const page = this.#scrollMode && this.#selectionPages.includes(index)
+            ? this.#scrollPages[index] : null
+        if (page) {
+            await this.#loadScrollPage(page)
+            await page.frame?.renderPromise
+        } else if (!this.#scrollMode && this.#selectionPages.includes(index)) {
+            const spread = this.getSpreadOf(this.book.sections[index])
+            if (spread) await this.#preloadSpread(spread.index)
+        }
+        return this.getContents().find(content => content.index === index)?.doc ?? null
     }
     get isOverflowX() {
         return this.#isOverflowX
@@ -1378,10 +1427,12 @@ export class FixedLayout extends HTMLElement {
     #getVisibleRange(index) {
         const doc = this.getContents().find(content => content.index === index)?.doc
         const iframe = doc?.defaultView?.frameElement
-        if (!doc || !iframe) return null
+        // A late scroll report can land while an iframe is between documents.
+        if (!doc?.documentElement || !iframe) return null
         // Text-layer only: PDF popup contents are not book text. Non-PDF fixed
         // layout retains the body as its selectable root.
-        const root = doc.querySelector('.textLayer') ?? doc.body
+        const root = doc.querySelector('[data-pdf-ocr-text]') ?? doc.querySelector('.textLayer') ?? doc.body
+        if (!root) return null
         const hostRect = this.getBoundingClientRect()
         const frameRect = iframe.getBoundingClientRect()
         const scale = frameRect.width / (doc.documentElement.clientWidth || frameRect.width) || 1
@@ -1491,46 +1542,12 @@ export class FixedLayout extends HTMLElement {
             const task = this.#preloadQueue.shift()
             if (!task) break
 
-            const { spread, cacheKey } = task
+            const { cacheKey, targetIndex } = task
             this.#preloadCache.set(cacheKey, 'loading')
             this.#activePreloads++
             Promise.resolve().then(async () => {
                 try {
-                    if (spread.center) {
-                        const src = await spread.center?.load?.()
-                        this.#preloadCache.set(cacheKey, { center: src })
-
-                        const sectionIndex = this.book.sections.indexOf(spread.center)
-                        const frame = await this.#createFrame({ index: sectionIndex, src, detached: true })
-
-                        this.#prerenderedSpreads.set(cacheKey, { center: frame })
-                        this.#spreadAccessTime.set(cacheKey, Date.now())
-                        if (frame.onZoom) {
-                            const doc = frame.iframe.contentDocument
-                            frame.onZoom({ doc, scale: this.#totalScaleFactor, pageColors: this.#pageColors })
-                        }
-                    } else {
-                        const srcL = await spread.left?.load?.()
-                        const srcR = await spread.right?.load?.()
-                        this.#preloadCache.set(cacheKey, { left: srcL, right: srcR })
-
-                        const indexL = this.book.sections.indexOf(spread.left)
-                        const indexR = this.book.sections.indexOf(spread.right)
-                        const leftFrame = await this.#createFrame({ index: indexL, src: srcL, detached: true })
-                        const rightFrame = await this.#createFrame({ index: indexR, src: srcR, detached: true })
-
-                        this.#prerenderedSpreads.set(cacheKey, { left: leftFrame, right: rightFrame })
-                        this.#spreadAccessTime.set(cacheKey, Date.now())
-
-                        if (leftFrame.onZoom) {
-                            const docL = leftFrame.iframe.contentDocument
-                            leftFrame.onZoom({ doc: docL, scale: this.#totalScaleFactor, pageColors: this.#pageColors })
-                        }
-                        if (rightFrame.onZoom) {
-                            const docR = rightFrame.iframe.contentDocument
-                            rightFrame.onZoom({ doc: docR, scale: this.#totalScaleFactor, pageColors: this.#pageColors })
-                        }
-                    }
+                    await this.#preloadSpread(targetIndex)
                 } catch {
                     this.#preloadCache.delete(cacheKey)
                     this.#prerenderedSpreads.delete(cacheKey)
@@ -1540,6 +1557,36 @@ export class FixedLayout extends HTMLElement {
                 }
             })
         }
+    }
+    async #preloadSpread(index) {
+        const key = `spread-${index}`
+        if (this.#spreadLoads.has(key)) return this.#spreadLoads.get(key)
+        if (this.#prerenderedSpreads.has(key)) return
+        const spread = this.#spreads[index]
+        if (!spread) return
+        const load = (async () => {
+            const sides = spread.center ? ['center'] : ['left', 'right']
+            const frames = {}, sources = {}
+            for (const side of sides) {
+                const section = spread[side]
+                const src = await section?.load?.()
+                sources[side] = src
+                const frame = await this.#createFrame({
+                    index: this.book.sections.indexOf(section), src, detached: true,
+                })
+                frames[side] = frame
+                if (frame.onZoom) await frame.onZoom({
+                    doc: frame.iframe.contentDocument,
+                    scale: this.#totalScaleFactor, pageColors: this.#pageColors,
+                })
+            }
+            this.#preloadCache.set(key, sources)
+            this.#prerenderedSpreads.set(key, frames)
+            this.#spreadAccessTime.set(key, Date.now())
+        })()
+        this.#spreadLoads.set(key, load)
+        try { await load }
+        finally { this.#spreadLoads.delete(key) }
     }
     #cleanupPreloadCache() {
         const maxSpreads = this.#maxCachedSpreads
@@ -1552,6 +1599,12 @@ export class FixedLayout extends HTMLElement {
                 key,
                 accessTime: this.#spreadAccessTime.get(key) || 0,
             }))
+            .filter(({ key }) => {
+                const frames = this.#prerenderedSpreads.get(key)
+                return !Object.values(frames).some(frame => frame?.iframe
+                    && this.#selectionPages.includes(Number(frame.iframe.dataset.sectionIndex)))
+                    && key !== `spread-${this.#index}`
+            })
             .sort((a, b) => a.accessTime - b.accessTime)
 
         const numToRemove = this.#prerenderedSpreads.size - maxSpreads
@@ -1667,6 +1720,21 @@ export class FixedLayout extends HTMLElement {
         if (left < hostRect.left || right > hostRect.right)
             this.scrollLeft += left - hostRect.left - 24
     }
+    scrollToPageRect(index, rect, viewport = { x: 0, y: 0, width: 1, height: 1 }) {
+        if (index !== this.index) return
+        const doc = this.getContents().find(content => content.index === index)?.doc
+        const iframe = doc?.defaultView?.frameElement
+        if (!iframe) return
+        const frame = iframe.getBoundingClientRect()
+        const host = this.getBoundingClientRect()
+        // Move the viewport over the intact page. Every original margin and
+        // annotation remains reachable, in the same document coordinate system.
+        this.scrollTop += frame.top + (rect.y + rect.height / 2) * frame.height
+            - host.top - (viewport.y + viewport.height / 2) * host.height
+        this.scrollLeft += frame.left + (rect.x + rect.width / 2) * frame.width
+            - host.left - (viewport.x + viewport.width / 2) * host.width
+        this.#reportLocation('navigation')
+    }
     async next(distance) {
         if (this.#scrollMode) {
             if (this.#scrollHorizontal) {
@@ -1744,7 +1812,8 @@ export class FixedLayout extends HTMLElement {
         return Array.from(this.#root.querySelectorAll('iframe'))
             .filter(frame => {
                 const parent = frame.parentElement
-                return parent && parent.style.visibility !== 'hidden'
+                return parent && (parent.style.visibility !== 'hidden'
+                    || this.#selectionPages.includes(Number(frame.dataset.sectionIndex)))
             })
             .map(frame => {
                 const index = frame.dataset.sectionIndex != null

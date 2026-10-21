@@ -21,7 +21,8 @@ const filter = NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT
 const acceptNode = node => {
     if (node.nodeType === 1) {
         const name = node.tagName.toLowerCase()
-        if (name === 'script' || name === 'style') return NodeFilter.FILTER_REJECT
+        if (name === 'script' || name === 'style' || node.hasAttribute('data-pdf-legacy'))
+            return NodeFilter.FILTER_REJECT
         return NodeFilter.FILTER_SKIP
     }
     return NodeFilter.FILTER_ACCEPT
@@ -29,7 +30,9 @@ const acceptNode = node => {
 
 export const textWalker = function* (x, func, filterFunc) {
     const root = x.commonAncestorContainer ?? x.body ?? x
-    const walker = document.createTreeWalker(root, filter, { acceptNode: filterFunc || acceptNode })
+    const walker = document.createTreeWalker(root, filter, { acceptNode: node =>
+        node.nodeType === 1 && node.hasAttribute('data-pdf-legacy')
+            ? NodeFilter.FILTER_REJECT : (filterFunc || acceptNode)(node) })
     const walk = x.commonAncestorContainer ? walkRange : walkDocument
     const nodes = walk(x, walker)
     const strs = nodes.map(node => node.nodeValue ?? '')

@@ -3,10 +3,32 @@ import * as CFI from './epubcfi.js'
 
 import '@pdfjs/pdf.min.mjs'
 import { appendOCR, ocrText } from './pdf-ocr.js'
+import { setupOCRSelection } from './pdf-selection.js'
 const pdfjsLib = globalThis.pdfjsLib
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsPath('pdf.worker.min.mjs')
 
 const fetchText = async url => await (await fetch(url)).text()
+
+// Some system WebViews support stream readers but not async iteration. PDF.js
+// getTextContent uses `for await`; consume its public stream with a reader so
+// extraction and import work with the same content and normalization there.
+const readTextContent = async page => {
+    if (!page.streamTextContent) return page.getTextContent()
+    const reader = page.streamTextContent().getReader()
+    const content = { items: [], styles: Object.create(null), lang: null }
+    try {
+        for (;;) {
+            const { value, done } = await reader.read()
+            if (done) return content
+            content.lang ??= value.lang
+            Object.assign(content.styles, value.styles)
+            content.items.push(...value.items)
+        }
+    } catch (error) {
+        await reader.cancel().catch(() => {})
+        throw error
+    } finally { reader.releaseLock() }
+}
 
 // The OS accessibility "font size" setting scales every piece of WebView-rendered
 // text (including this transparent selection/highlight text layer) but leaves the
@@ -34,6 +56,7 @@ let annotationLayerBuilderCSS = null
 
 // Track active render tasks per iframe document to cancel superseded renders
 const activeRenderTasks = new WeakMap()
+const activeTextTasks = new WeakMap()
 // Generation counter per document to detect stale renders after async gaps
 const renderGenerations = new WeakMap()
 
@@ -77,6 +100,7 @@ const setupPanningEvents = (doc) => {
     }
 
     container.onpointerdown = (e) => {
+        if (e.button !== 0 || !e.isPrimary) return
         const selection = doc.getSelection()
         const hasTextSelection = selection && selection.toString().length > 0
 
@@ -205,6 +229,7 @@ const render = async (page, doc, zoom, pageColors, ocr) => {
         existingTask.cancel()
         activeRenderTasks.delete(doc)
     }
+    activeTextTasks.get(doc)?.cancel()
 
     // Rasterise the page bitmap over-sampled (clamped for the iOS content-process
     // memory budget, see getRenderDpr / readest #5118) but lay the whole DOM out
@@ -217,10 +242,6 @@ const render = async (page, doc, zoom, pageColors, ocr) => {
     // annotation layers live in real display coordinates.
     const renderDpr = getRenderDpr(page, zoom)
     const renderScale = zoom * renderDpr
-    doc.documentElement.style.setProperty('--total-scale-factor', zoom)
-    doc.documentElement.style.setProperty('--user-unit', '1')
-    doc.documentElement.style.setProperty('--scale-round-x', '1px')
-    doc.documentElement.style.setProperty('--scale-round-y', '1px')
     // The bitmap viewport is over-sampled; the display viewport drives the CSS
     // box, the text layer and the annotation layer (all in display coordinates).
     const renderViewport = page.getViewport({ scale: renderScale })
@@ -269,26 +290,49 @@ const render = async (page, doc, zoom, pageColors, ocr) => {
         return
     }
 
-    // Release old canvas bitmap memory before replacing
-    const oldCanvas = canvasElement.querySelector('canvas')
-    if (oldCanvas) {
-        oldCanvas.width = 0
-        oldCanvas.height = 0
-    }
-    canvasElement.replaceChildren(doc.adoptNode(canvas))
-
-    // Clear text layer before re-rendering to prevent DOM accumulation
+    // Render into an isolated, CFI-inert staging layer. A cancelled zoom must
+    // never append old text into a newer layer or expose a new bitmap with old
+    // hit targets. The live canvas and text swap together after both are ready.
     const container = doc.querySelector('.textLayer')
-    container.replaceChildren()
-    const textLayer = new pdfjsLib.TextLayer({
-        textContentSource: await page.streamTextContent(),
-        container, viewport: displayViewport,
-    })
-    await textLayer.render()
-    appendOCR(container, ocr, displayViewport)
-
-    // Bail out if superseded after async text layer render
-    if (renderGenerations.get(doc) !== generation) return
+    const staged = doc.createElement('div')
+    staged.className = 'textLayer'
+    staged.setAttribute('cfi-inert', '')
+    Object.assign(staged.style, { visibility: 'hidden', pointerEvents: 'none' })
+    staged.style.setProperty('--total-scale-factor', zoom)
+    staged.style.setProperty('--user-unit', '1')
+    staged.style.setProperty('--scale-round-x', '1px')
+    staged.style.setProperty('--scale-round-y', '1px')
+    doc.body.append(staged)
+    let textLayer
+    try {
+        const source = await page.streamTextContent()
+        if (renderGenerations.get(doc) !== generation) return
+        textLayer = new pdfjsLib.TextLayer({
+            textContentSource: source, container: staged, viewport: displayViewport,
+        })
+        activeTextTasks.set(doc, textLayer)
+        await textLayer.render()
+        if (renderGenerations.get(doc) !== generation) return
+        appendOCR(staged, ocr, displayViewport)
+        const oldCanvas = canvasElement.querySelector('canvas')
+        if (oldCanvas) oldCanvas.width = oldCanvas.height = 0
+        canvasElement.replaceChildren(doc.adoptNode(canvas))
+        staged.style.removeProperty('visibility')
+        staged.style.removeProperty('pointer-events')
+        container.style.cssText = staged.style.cssText
+        container.replaceChildren(...staged.childNodes)
+        doc.documentElement.style.setProperty('--total-scale-factor', zoom)
+        doc.documentElement.style.setProperty('--user-unit', '1')
+        doc.documentElement.style.setProperty('--scale-round-x', '1px')
+        doc.documentElement.style.setProperty('--scale-round-y', '1px')
+    } catch (error) {
+        if (renderGenerations.get(doc) === generation) throw error
+        return
+    } finally {
+        staged.remove()
+        if (!canvas.isConnected) canvas.width = canvas.height = 0
+        if (activeTextTasks.get(doc) === textLayer) activeTextTasks.delete(doc)
+    }
 
     // Counteract the OS font-size accessibility scaling on the text layer's glyph
     // size only (see getFontScale). `--text-scale-factor` feeds `font-size` and
@@ -317,6 +361,7 @@ const render = async (page, doc, zoom, pageColors, ocr) => {
     container.append(endOfContent)
 
     // Set up panning/selection event handlers once per document
+    setupOCRSelection(container)
     setupPanningEvents(doc)
 
     // Clear annotation layer before re-rendering to prevent DOM accumulation
@@ -334,9 +379,10 @@ const render = async (page, doc, zoom, pageColors, ocr) => {
     await new pdfjsLib.AnnotationLayer({ page, viewport: displayViewport, div, linkService }).render({
         annotations: await page.getAnnotations(),
     })
+    return generation
 }
 
-const renderPage = async (page, getImageBlob, ocr = null) => {
+const renderPage = async (page, getImageBlob, ocr = null, prepareOCR, labels) => {
     const viewport = page.getViewport({ scale: 1 })
     if (getImageBlob) {
         const canvas = document.createElement('canvas')
@@ -377,7 +423,51 @@ const renderPage = async (page, getImageBlob, ocr = null) => {
         <div class="annotationLayer"></div>
     `
     const src = URL.createObjectURL(new Blob([data], { type: 'text/html' }))
-    const onZoom = ({ doc, scale, pageColors }) => render(page, doc, scale, pageColors, ocr)
+    const onZoom = async ({ doc, scale, pageColors }) => {
+        const generation = await render(page, doc, scale, pageColors, ocr)
+        if (generation == null || renderGenerations.get(doc) !== generation) return
+        const container = doc.querySelector('.textLayer')
+        const publish = result => {
+            const end = container.querySelector('.endOfContent')
+            end?.remove()
+            appendOCR(container, result, page.getViewport({ scale }))
+            if (end) container.append(end)
+            setupOCRSelection(container)
+            doc.querySelector('[data-pdf-ocr-status]')?.remove()
+            doc.dispatchEvent(new Event('pdf-text-ready'))
+        }
+        // Recognition may finish while render() is painting a new scale using
+        // its earlier empty OCR snapshot. Publish the now-ready words too.
+        if (ocr && !container?.textContent?.trim()) publish(ocr)
+        if (!prepareOCR || ocr || container?.textContent?.trim()) {
+            doc.querySelector('[data-pdf-ocr-status]')?.remove()
+            return
+        }
+        const current = () => Boolean(doc.defaultView?.frameElement?.isConnected)
+        if (!current()) return
+        let status = doc.querySelector('[data-pdf-ocr-status]')
+        if (!status) {
+            status = doc.createElement('div')
+            status.setAttribute('data-pdf-ocr-status', '')
+            status.setAttribute('cfi-inert', '')
+            status.setAttribute('role', 'status')
+            status.style.cssText = 'position:fixed;top:8px;right:8px;padding:4px 8px;background:Canvas;color:CanvasText;font:12px sans-serif;pointer-events:none'
+            doc.body.append(status)
+        }
+        status.textContent = labels?.loading ?? 'Recognizing page text…'
+        // Paint first. Recognition neither delays the canvas nor page navigation.
+        void prepareOCR(current).then(result => {
+            if (result) ocr = result
+            if (!current() || renderGenerations.get(doc) !== generation) return
+            if (!result) throw new Error('pdf_recognition_failed')
+            // Keep the same direct-child order as an OCR page loaded from
+            // disk; otherwise a new highlight would have a different CFI on reopen.
+            publish(result)
+        }).catch(() => {
+            if (current() && renderGenerations.get(doc) === generation)
+                status.textContent = labels?.failed ?? 'Page text could not be recognized.'
+        })
+    }
     return { src, data, onZoom }
 }
 
@@ -479,41 +569,77 @@ const parseCalibreSeriesFromXMP = raw => {
 // WebView's heap, crashing on 50 MB+ PDFs (readest #3470). Throttle here.
 const MAX_CONCURRENT_RANGES = 6
 
-export const makePDF = async (file, { loadOCR } = {}) => {
+export const makePDF = async (file, { loadOCR, recognizeOCR, disposeOCR, ocrLabels } = {}) => {
     const transport = new pdfjsLib.PDFDataRangeTransport(file.size, [])
     // Bound the concurrent range reads instead of dispatching them all at once.
     let active = 0
+    let stopped = false
+    let loadingTask
+    let rangeError
+    const pendingReads = new Set()
+    const withRanges = promise => {
+        if (rangeError) {
+            Promise.resolve(promise).catch(() => {})
+            return Promise.reject(rangeError)
+        }
+        return new Promise((resolve, reject) => {
+            pendingReads.add(reject)
+            Promise.resolve(promise).then(resolve, reject)
+                .finally(() => pendingReads.delete(reject))
+        })
+    }
     const queue = []
+    const stop = () => { stopped = true; queue.length = 0 }
+    const fail = error => {
+        if (stopped) return
+        stop()
+        const message = error instanceof Error ? error.message : ''
+        rangeError = new Error(/^pdf_range_(?:truncated|mismatch|read_failed)$/.test(message)
+            ? message : 'pdf_range_read_failed')
+        for (const reject of pendingReads) reject(rangeError)
+        pendingReads.clear()
+        Promise.resolve().then(() => loadingTask?.destroy?.()).catch(() => {})
+    }
     const pump = () => {
-        while (active < MAX_CONCURRENT_RANGES && queue.length) {
+        while (!stopped && active < MAX_CONCURRENT_RANGES && queue.length) {
             const [begin, end] = queue.shift()
             active++
-            file.slice(begin, end).arrayBuffer()
-                .then(chunk => transport.onDataRange(begin, chunk))
+            Promise.resolve().then(() => file.slice(begin, end).arrayBuffer())
+                .then(chunk => {
+                    if (stopped) return
+                    if (chunk.byteLength !== end - begin)
+                        throw new Error(chunk.byteLength < end - begin
+                            ? 'pdf_range_truncated' : 'pdf_range_mismatch')
+                    transport.onDataRange(begin, chunk)
+                })
+                .catch(fail)
                 .finally(() => { active--; pump() })
         }
     }
+    transport.abort = stop
     transport.requestDataRange = (begin, end) => {
+        if (stopped) return
         queue.push([begin, end])
         pump()
     }
-    const pdf = await pdfjsLib.getDocument({
+    loadingTask = pdfjsLib.getDocument({
         range: transport,
         wasmUrl: pdfjsPath(''),
         cMapUrl: pdfjsPath('cmaps/'),
         standardFontDataUrl: pdfjsPath('standard_fonts/'),
         isEvalSupported: false,
-    }).promise
+    })
+    const pdf = await withRanges(loadingTask.promise)
 
     // Get viewport dimensions from first page for fixed-layout rendering
-    const firstPage = await pdf.getPage(1)
+    const firstPage = await withRanges(pdf.getPage(1))
     const firstViewport = firstPage.getViewport({ scale: 1 })
     const book = { rendition: {
         layout: 'pre-paginated',
         viewport: { width: firstViewport.width, height: firstViewport.height },
     } }
 
-    const { metadata, info } = await pdf.getMetadata() ?? {}
+    const { metadata, info } = await withRanges(pdf.getMetadata()) ?? {}
     // TODO: for better results, parse `metadata.getRaw()`
     book.metadata = {
         title: metadata?.get('dc:title') ?? info?.Title,
@@ -533,10 +659,10 @@ export const makePDF = async (file, { loadOCR } = {}) => {
 
     const destinations = new Map()
     const resolve = value => resolveDestination(value, pdf)
-    const outline = await pdf.getOutline()
+    const outline = await withRanges(pdf.getOutline())
     book.toc = outline?.length
         ? await Promise.all(outline.map(item => makeTOCItem(item, resolve, destinations))) : []
-    const labels = await pdf.getPageLabels?.()
+    const labels = await withRanges(pdf.getPageLabels?.())
     book.pageList = Array.from({ length: pdf.numPages }, (_, index) => {
         const dest = [index, { name: 'Fit' }]
         const href = JSON.stringify(dest)
@@ -565,7 +691,7 @@ export const makePDF = async (file, { loadOCR } = {}) => {
             pageCache.set(i, cached)
             return cached
         }
-        const page = await pdf.getPage(i + 1)
+        const page = await withRanges(pdf.getPage(i + 1))
         pageCache.set(i, page)
 
         // Evict oldest pages when over limit, freeing internal page data
@@ -588,7 +714,8 @@ export const makePDF = async (file, { loadOCR } = {}) => {
                 cache.set(i, cached)
                 return cached
             }
-            const url = await renderPage(await getPage(i), false, await loadOCR?.(i))
+            const url = await renderPage(await getPage(i), false, await loadOCR?.(i),
+                recognizeOCR && (current => recognizeOCR(i, current)), ocrLabels)
             cache.set(i, url)
 
             // Evict oldest render results when over limit
@@ -627,7 +754,7 @@ export const makePDF = async (file, { loadOCR } = {}) => {
                 })
                 await textLayerInstance.render()
             } else {
-                const content = await page.getTextContent()
+                const content = await readTextContent(page)
                 for (const item of content.items) {
                     if (item.str) {
                         const span = doc.createElement('span')
@@ -642,10 +769,86 @@ export const makePDF = async (file, { loadOCR } = {}) => {
         size: 1000,
     }))
     book.isExternal = uri => /^\w+:/i.test(uri)
+    // Separate bounded bitmap work from the reader's text layers and CFI cache.
+    book.getPDFImage = async (index, width = 180, region) => {
+        if (!Number.isInteger(index) || index < 0 || index >= pdf.numPages
+            || !Number.isFinite(width) || width < 1 || width > 3200)
+            throw new Error('invalid_pdf_image')
+        const r = region ?? { x: 0, y: 0, width: 1, height: 1 }
+        if (![r.x, r.y, r.width, r.height].every(Number.isFinite)
+            || r.x < 0 || r.y < 0 || r.width <= 0 || r.height <= 0
+            || r.x + r.width > 1.001 || r.y + r.height > 1.001)
+            throw new Error('invalid_pdf_region')
+        const page = await getPage(index)
+        const base = page.getViewport({ scale: 1 })
+        const scale = Math.min(width / (base.width * r.width),
+            Math.sqrt(4_000_000 / (base.width * base.height * r.width * r.height)))
+        const viewport = page.getViewport({ scale })
+        const canvas = document.createElement('canvas')
+        canvas.width = Math.max(1, Math.ceil(viewport.width * r.width))
+        canvas.height = Math.max(1, Math.ceil(viewport.height * r.height))
+        try {
+            await page.render({ canvasContext: canvas.getContext('2d'), viewport,
+                transform: [1, 0, 0, 1, -r.x * viewport.width, -r.y * viewport.height],
+                background: '#ffffff' }).promise
+            return await new Promise((resolve, reject) => canvas.toBlob(
+                blob => blob ? resolve(blob) : reject(new Error('pdf_image_failed')), 'image/png'))
+        } finally { canvas.width = canvas.height = 0 }
+    }
     book.getPDFText = async index => {
-        const content = await (await getPage(index)).getTextContent()
+        const content = await withRanges(readTextContent(await getPage(index)))
         const native = content.items.map(item => (item.str ?? '') + (item.hasEOL ? '\n' : ' ')).join('')
         return native.trim() ? native : ocrText(await loadOCR?.(index))
+    }
+    book.getPDFContentsLines = async (index, allRows = false) => {
+        const content = await withRanges(readTextContent(await getPage(index)))
+        const rows = []
+        for (const item of content.items) {
+            if (!item.str?.trim() || !item.transform) continue
+            const x = item.transform[4], y = item.transform[5]
+            const height = Math.max(1, item.height ?? Math.abs(item.transform[3]))
+            let row = rows.find(row => Math.abs(row.y - y) <= Math.min(row.height, height) * .5)
+            if (!row) rows.push(row = { y, height, items: [] })
+            row.items.push({ text: item.str, x, width: item.width, height })
+        }
+        const prepared = rows.sort((a, b) => b.y - a.y).map(row => {
+            row.items.sort((a, b) => a.x - b.x)
+            const text = row.items.map(item => item.text.trim()).join(' ').normalize('NFKC')
+            const last = row.items.at(-1), previous = row.items.at(-2)
+            const gap = previous && /^(?:\d{1,4}|[ivxlcdm]+)$/i.test(last.text.trim())
+                && last.x - (previous.x + previous.width) >= Math.max(last.height, previous.height) * 1.5
+            return { text, height: row.height, contents: gap || /[.·…_。•⋯∙●‧﹒]{2,}\s*(?:\d{1,4}|[ivxlcdm]+)\s*$/i.test(text) }
+        })
+        const sizes = prepared.filter(row => row.contents).map(row => row.height).sort((a,b) => a-b)
+        const minimum = (sizes[Math.floor(sizes.length / 2)] ?? 0) * .8
+        return prepared.filter(row => allRows ? row.height >= minimum : row.contents).map(row => row.text)
+    }
+    book.getPDFAnnotationRects = async cfi => {
+        const parts = CFI.parse(cfi)
+        const index = CFI.fake.toIndex((parts.parent ?? parts).shift())
+        const page = await getPage(index)
+        const viewport = page.getViewport({ scale: 1 })
+        const frame = document.createElement('iframe')
+        frame.style.cssText = `position:fixed;left:-100000px;top:0;width:${viewport.width}px;height:${viewport.height}px;visibility:hidden;border:0`
+        const entry = await renderPage(page, false, await loadOCR?.(index))
+        let timer
+        try {
+            await new Promise((resolve, reject) => {
+                timer = setTimeout(() => reject(new Error('pdf_annotation_timeout')), 15000)
+                frame.onload = resolve
+                frame.onerror = () => reject(new Error('pdf_annotation_unresolved'))
+                frame.srcdoc = entry.data
+                document.body.append(frame)
+            })
+            await entry.onZoom({ doc: frame.contentDocument, scale: 1 })
+            const range = CFI.toRange(frame.contentDocument, parts)
+            const rects = Array.from(range.getClientRects()).filter(r => r.width > 0 && r.height > 0)
+                .map(r => ({ x: Math.max(0, r.x / viewport.width), y: Math.max(0, r.y / viewport.height),
+                    width: Math.min(r.width, viewport.width - r.x) / viewport.width,
+                    height: Math.min(r.height, viewport.height - r.y) / viewport.height }))
+            if (!rects.length) throw new Error('pdf_annotation_unresolved')
+            return { index, rects }
+        } finally { clearTimeout(timer); frame.remove(); URL.revokeObjectURL(entry.src) }
     }
     book.resolveHref = async href => {
         let target = destinations.get(href)
@@ -662,6 +865,8 @@ export const makePDF = async (file, { loadOCR } = {}) => {
     book.getTOCFragment = doc => doc.documentElement
     book.getCover = async () => renderPage(await pdf.getPage(1), true)
     book.destroy = () => {
+        stop()
+        disposeOCR?.()
         // Clean up all cached canvases and revoke blob URLs
         for (const [, entry] of cache) {
             if (entry?.src) URL.revokeObjectURL(entry.src)

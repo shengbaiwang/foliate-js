@@ -261,6 +261,7 @@ const languageInfo = lang => {
 
 export class View extends HTMLElement {
     #root = this.attachShadow({ mode: 'open' })
+    #pdfSelection = null
     #sectionProgress
     #tocProgress
     #pageProgress
@@ -275,6 +276,7 @@ export class View extends HTMLElement {
     constructor() {
         super()
         this.history.addEventListener('popstate', ({ detail }) => {
+            this.#pdfSelection?.clear({ native: true })
             const resolved = this.resolveNavigation(detail.state)
             this.renderer.goTo(resolved)
         })
@@ -304,6 +306,10 @@ export class View extends HTMLElement {
         if (this.isFixedLayout) {
             await import('./fixed-layout.js')
             this.renderer = document.createElement('foliate-fxl')
+            if (book.getPDFAnnotationRects) {
+                const { PDFCrossPageSelection } = await import('./pdf-cross-page-selection.js')
+                this.#pdfSelection = new PDFCrossPageSelection(this)
+            }
         } else {
             await import('./paginator.js')
             this.renderer = document.createElement('foliate-paginator')
@@ -322,6 +328,7 @@ export class View extends HTMLElement {
             this.mediaOverlay = book.getMediaOverlay()
             let lastActive
             this.mediaOverlay.addEventListener('highlight', e => {
+                this.#pdfSelection?.clear({ native: true })
                 const resolved = this.resolveNavigation(e.detail.text)
                 this.renderer.goTo(resolved)
                     .then(() => {
@@ -345,6 +352,8 @@ export class View extends HTMLElement {
         }
     }
     close() {
+        this.#pdfSelection?.destroy()
+        this.#pdfSelection = null
         this.renderer?.destroy()
         this.renderer?.remove()
         this.#sectionProgress = null
@@ -389,6 +398,7 @@ export class View extends HTMLElement {
         this.#emit('relocate', this.lastLocation)
     }
     #onLoad({ doc, index }) {
+        this.#pdfSelection?.attach(doc, index)
         // set language and dir if not already set
         doc.documentElement.lang ||= this.language.canonical ?? ''
         if (!this.language.isCJK)
@@ -462,21 +472,30 @@ export class View extends HTMLElement {
             }
             return
         }
-        const { index, anchor } = await this.resolveNavigation(value)
-        const obj = this.#getOverlayer(index)
-        if (obj) {
-            const { overlayer, doc } = obj
-            overlayer.remove(value)
-            if (!remove) {
-                const range = doc ? anchor(doc) : anchor
-                if (range) {
-                    const draw = (func, opts) => overlayer.add(value, range, func, opts)
-                    this.#emit('draw-annotation', { draw, annotation, doc, range })
+        const targets = annotation.pdfRanges ?? [value]
+        if (annotation.pdfRanges !== undefined && (!Array.isArray(targets)
+            || targets.length < 2 || targets.length > 24 || targets[0] !== value
+            || targets.some(x => typeof x !== 'string' || !CFI.isCFI.test(x))))
+            throw new Error('pdf_annotation_unresolved')
+        let firstIndex
+        for (const target of targets) {
+            const { index, anchor } = await this.resolveNavigation(target)
+            firstIndex ??= index
+            const obj = this.#getOverlayer(index)
+            if (obj) {
+                const { overlayer, doc } = obj
+                overlayer.remove(value)
+                if (!remove) {
+                    const range = doc ? anchor(doc) : anchor
+                    if (range) {
+                        const draw = (func, opts) => overlayer.add(value, range, func, opts)
+                        this.#emit('draw-annotation', { draw, annotation, doc, range })
+                    }
                 }
             }
         }
-        const label = this.#tocProgress?.getProgress(index)?.label ?? ''
-        return { index, label }
+        const label = this.#tocProgress?.getProgress(firstIndex)?.label ?? ''
+        return { index: firstIndex, label }
     }
     deleteAnnotation(annotation) {
         return this.addAnnotation(annotation, true)
@@ -559,6 +578,7 @@ export class View extends HTMLElement {
         }
     }
     async goTo(target) {
+        this.#pdfSelection?.clear({ native: true })
         const resolved = this.resolveNavigation(target)
         try {
             await this.renderer.goTo(resolved)
@@ -570,11 +590,13 @@ export class View extends HTMLElement {
         }
     }
     async goToFraction(frac) {
+        this.#pdfSelection?.clear({ native: true })
         const [index, anchor] = this.#sectionProgress.getSection(frac)
         await this.renderer.goTo({ index, anchor })
         this.history.pushState({ fraction: frac })
     }
     async select(target) {
+        this.#pdfSelection?.clear({ native: true })
         try {
             const obj = await this.resolveNavigation(target)
             await this.renderer.goTo({ ...obj, select: true })
@@ -585,9 +607,15 @@ export class View extends HTMLElement {
         }
     }
     deselect() {
+        this.#pdfSelection?.clear({ native: true })
         for (const { doc } of this.renderer.getContents())
-            doc.defaultView.getSelection().removeAllRanges()
+            doc?.defaultView?.getSelection()?.removeAllRanges()
     }
+    getPDFSelection() { return this.#pdfSelection?.ranges ?? null }
+    startPDFSelectionHandle(cfis, side) { return this.#pdfSelection?.startHandle(cfis, side) ?? Promise.resolve(false) }
+    extendPDFSelectionHandle(direction) { return this.#pdfSelection?.extendHandle(direction) ?? Promise.resolve(false) }
+    movePDFSelectionHandle(point) { this.#pdfSelection?.moveHandle(point) }
+    stopPDFSelectionHandle() { this.#pdfSelection?.stopHandle() }
     getSectionFractions() {
         return (this.#sectionProgress?.sectionFractions ?? [])
             .map(x => x + Number.EPSILON)
@@ -617,9 +645,11 @@ export class View extends HTMLElement {
         }
     }
     async prev(distance) {
+        this.#pdfSelection?.clear({ native: true })
         await this.renderer.prev(distance)
     }
     async next(distance) {
+        this.#pdfSelection?.clear({ native: true })
         await this.renderer.next(distance)
     }
     async pan(dx, dy) {
