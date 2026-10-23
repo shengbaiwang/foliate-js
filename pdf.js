@@ -800,8 +800,40 @@ export const makePDF = async (file, { loadOCR, recognizeOCR, disposeOCR, ocrLabe
         const native = content.items.map(item => (item.str ?? '') + (item.hasEOL ? '\n' : ' ')).join('')
         return native.trim() ? native : ocrText(await loadOCR?.(index))
     }
-    book.getPDFContentsLines = async (index, allRows = false) => {
-        const content = await withRanges(readTextContent(await getPage(index)))
+    // Native internal links nominate destinations without OCR or guessed page
+    // offsets. The caller still verifies every title on its destination page.
+    book.getPDFContentsLinks = async index => {
+        const page = await getPage(index)
+        const annotations = (await page.getAnnotations()).filter(a => a.subtype === 'Link' && a.dest != null)
+        if (!annotations.length || annotations.length > 128) return null
+        const content = await withRanges(readTextContent(page))
+        const entries = []
+        for (const annotation of annotations) {
+            const target = await resolve(annotation.dest)
+            if (!target || target.index === index || !Array.isArray(annotation.rect)) return null
+            const [left, bottom, right, top] = annotation.rect
+            const items = content.items.filter(item => {
+                if (!item.str?.trim() || !item.transform) return false
+                const x = item.transform[4] + (item.width ?? 0) / 2
+                const y = item.transform[5] + (item.height ?? Math.abs(item.transform[3])) / 2
+                return x >= left - 1 && x <= right + 1 && y >= bottom - 1 && y <= top + 1
+            }).sort((a, b) => b.transform[5] - a.transform[5] || a.transform[4] - b.transform[4])
+            const title = items.map(item => item.str.trim()).join(' ').replace(/^[•●·\-]\s*/, '').trim()
+            if (!title || title.length > 500) return null
+            entries.push({ title, pageIndex: target.index, left, top })
+        }
+        entries.sort((a, b) => b.top - a.top || a.left - b.left)
+        const indents = []
+        for (const left of entries.map(entry => entry.left).sort((a, b) => a - b))
+            if (!indents.some(indent => Math.abs(left - indent) < 8)) indents.push(left)
+        if (indents.length > 6) return null
+        return entries.map(entry => ({ title: entry.title, pageIndex: entry.pageIndex,
+            level: indents.findIndex(indent => Math.abs(entry.left - indent) < 8) }))
+    }
+    const getContentsRows = async index => {
+        const page = await getPage(index)
+        const content = await withRanges(readTextContent(page))
+        const viewport = page.getViewport({ scale: 1 })
         const rows = []
         for (const item of content.items) {
             if (!item.str?.trim() || !item.transform) continue
@@ -817,11 +849,26 @@ export const makePDF = async (file, { loadOCR, recognizeOCR, disposeOCR, ocrLabe
             const last = row.items.at(-1), previous = row.items.at(-2)
             const gap = previous && /^(?:\d{1,4}|[ivxlcdm]+)$/i.test(last.text.trim())
                 && last.x - (previous.x + previous.width) >= Math.max(last.height, previous.height) * 1.5
-            return { text, height: row.height, contents: gap || /[.·…_。•⋯∙●‧﹒]{2,}\s*(?:\d{1,4}|[ivxlcdm]+)\s*$/i.test(text) }
+            const boxes = row.items.map(item => viewport.convertToViewportRectangle(
+                [item.x, row.y, item.x + item.width, row.y + item.height]))
+            const left = Math.min(...boxes.map(box => Math.min(box[0], box[2])))
+            const top = Math.min(...boxes.map(box => Math.min(box[1], box[3])))
+            const right = Math.max(...boxes.map(box => Math.max(box[0], box[2])))
+            const bottom = Math.max(...boxes.map(box => Math.max(box[1], box[3])))
+            return { text, x: left / viewport.width, y: top / viewport.height,
+                width: (right - left) / viewport.width, height: (bottom - top) / viewport.height,
+                contents: gap || /[.·…_。•⋯∙●‧﹒]{2,}\s*(?:\d{1,4}|[ivxlcdm]+)\s*$/i.test(text) }
         })
+        return prepared
+    }
+    book.getPDFContentsLayout = async index => (await getContentsRows(index))
+        .map(({ text, x, y, width, height }) => ({ text, x, y, width, height }))
+    book.getPDFContentsLines = async (index, allRows = false) => {
+        const prepared = await getContentsRows(index)
         const sizes = prepared.filter(row => row.contents).map(row => row.height).sort((a,b) => a-b)
         const minimum = (sizes[Math.floor(sizes.length / 2)] ?? 0) * .8
-        return prepared.filter(row => allRows ? row.height >= minimum : row.contents).map(row => row.text)
+        const tolerance = Math.max(.000001, minimum * .02)
+        return prepared.filter(row => allRows ? row.contents || row.height + tolerance >= minimum : row.contents).map(row => row.text)
     }
     book.getPDFAnnotationRects = async cfi => {
         const parts = CFI.parse(cfi)

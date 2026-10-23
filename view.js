@@ -372,6 +372,26 @@ export class View extends HTMLElement {
             ?.find(m => m.type.includes('bodymatter') || m.type.includes('text'))
             ?.href ?? this.book.sections.findIndex(s => s.linear !== 'no'))
     }
+    // Refresh navigation after a verified local outline changes, keeping the
+    // renderer, text selection, CFI and history alive.
+    async updateTOC(toc, signal) {
+        const book = this.book
+        const renderer = this.renderer
+        if (!book?.splitTOCHref || !book.getTOCFragment) return
+        const progress = new TOCProgress()
+        await progress.init({ toc, ids: book.sections.map(s => s.id),
+            splitHref: book.splitTOCHref.bind(book),
+            getFragment: book.getTOCFragment.bind(book) })
+        if (signal?.aborted || this.book !== book || this.renderer !== renderer
+            || !this.#sectionProgress) return
+        book.toc = toc
+        this.#tocProgress = progress
+        if (this.lastLocation && this.renderer?.index != null) {
+            this.lastLocation = { ...this.lastLocation,
+                tocItem: progress.getProgress(this.renderer.index, this.lastLocation.range) }
+            this.#emit('relocate', this.lastLocation)
+        }
+    }
     async init({ lastLocation, showTextStart }) {
         const resolved = lastLocation ? this.resolveNavigation(lastLocation) : null
         if (resolved) {
