@@ -569,7 +569,17 @@ const parseCalibreSeriesFromXMP = raw => {
 // WebView's heap, crashing on 50 MB+ PDFs (readest #3470). Throttle here.
 const MAX_CONCURRENT_RANGES = 6
 
-export const makePDF = async (file, { loadOCR, recognizeOCR, disposeOCR, ocrLabels } = {}) => {
+/**
+ * @param {File} file
+ * @param {{
+ *   loadOCR?: (index: number) => Promise<object | null>,
+ *   recognizeOCR?: (index: number, current: () => boolean) => Promise<object | null>,
+ *   disposeOCR?: () => unknown,
+ *   ocrLabels?: { loading: string, failed: string },
+ *   importOnly?: boolean,
+ * }} [options]
+ */
+export const makePDF = async (file, { loadOCR, recognizeOCR, disposeOCR, ocrLabels, importOnly = false } = {}) => {
     const transport = new pdfjsLib.PDFDataRangeTransport(file.size, [])
     // Bound the concurrent range reads instead of dispatching them all at once.
     let active = 0
@@ -629,17 +639,26 @@ export const makePDF = async (file, { loadOCR, recognizeOCR, disposeOCR, ocrLabe
         standardFontDataUrl: pdfjsPath('standard_fonts/'),
         isEvalSupported: false,
     })
-    const pdf = await withRanges(loadingTask.promise)
+    const openPart = async promise => {
+        try { return await withRanges(promise) }
+        catch (error) {
+            stop()
+            // Range failures already destroy the loading task in fail().
+            if (!rangeError) await Promise.resolve(loadingTask.destroy()).catch(() => {})
+            throw error
+        }
+    }
+    const pdf = await openPart(loadingTask.promise)
 
     // Get viewport dimensions from first page for fixed-layout rendering
-    const firstPage = await withRanges(pdf.getPage(1))
+    const firstPage = await openPart(pdf.getPage(1))
     const firstViewport = firstPage.getViewport({ scale: 1 })
     const book = { rendition: {
         layout: 'pre-paginated',
         viewport: { width: firstViewport.width, height: firstViewport.height },
     } }
 
-    const { metadata, info } = await withRanges(pdf.getMetadata()) ?? {}
+    const { metadata, info } = await openPart(pdf.getMetadata()) ?? {}
     // TODO: for better results, parse `metadata.getRaw()`
     book.metadata = {
         title: metadata?.get('dc:title') ?? info?.Title,
@@ -657,12 +676,27 @@ export const makePDF = async (file, { loadOCR, recognizeOCR, disposeOCR, ocrLabe
     const calibreSeries = parseCalibreSeriesFromXMP(metadata?.getRaw?.())
     if (calibreSeries) book.metadata.belongsTo = { series: calibreSeries }
 
+    // Import validates the actual parser, first page and metadata, but does not
+    // need navigation destinations or per-page reading objects. The reader and
+    // contents task open their own full document after the durable import.
+    if (importOnly) {
+        book.toc = []
+        book.sections = []
+        book.getCover = () => withRanges(renderPage(firstPage, true))
+        book.destroy = () => {
+            stop()
+            disposeOCR?.()
+            return loadingTask.destroy()
+        }
+        return book
+    }
+
     const destinations = new Map()
     const resolve = value => resolveDestination(value, pdf)
-    const outline = await withRanges(pdf.getOutline())
+    const outline = await openPart(pdf.getOutline())
     book.toc = outline?.length
-        ? await Promise.all(outline.map(item => makeTOCItem(item, resolve, destinations))) : []
-    const labels = await withRanges(pdf.getPageLabels?.())
+        ? await openPart(Promise.all(outline.map(item => makeTOCItem(item, resolve, destinations)))) : []
+    const labels = await openPart(pdf.getPageLabels?.())
     book.pageList = Array.from({ length: pdf.numPages }, (_, index) => {
         const dest = [index, { name: 'Fit' }]
         const href = JSON.stringify(dest)
