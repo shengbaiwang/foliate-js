@@ -386,9 +386,14 @@ export class View extends HTMLElement {
             || !this.#sectionProgress) return
         book.toc = toc
         this.#tocProgress = progress
-        if (this.lastLocation && this.renderer?.index != null) {
+        // The visible range may belong to a different section than the
+        // paginator's primary view when several sections share a viewport.
+        const doc = this.lastLocation?.range?.startContainer.getRootNode()
+        const index = renderer.getContents().find(content => content.doc === doc)?.index
+            ?? renderer.primaryIndex ?? renderer.index
+        if (this.lastLocation && index != null) {
             this.lastLocation = { ...this.lastLocation,
-                tocItem: progress.getProgress(this.renderer.index, this.lastLocation.range) }
+                tocItem: progress.getProgress(index, this.lastLocation.range) }
             this.#emit('relocate', this.lastLocation)
         }
     }
