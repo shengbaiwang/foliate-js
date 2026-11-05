@@ -1,8 +1,7 @@
-// Keep the browser Selection/Range as the public selection. Only mouse endpoint
-// hit testing on the OCR projection is geometric: Chromium can place a caret at
-// the opposite end of a transformed word in a clipped/scrolled PDF iframe.
-// Touch handles, native PDF text, keyboard extension and persisted CFIs retain
-// their normal paths.
+// Keep browser Selection/Range and persisted CFIs as the public selection.
+// Mouse endpoints use visible glyph geometry: native caret hit testing can jump
+// to a whole line/paragraph between the absolutely positioned PDF text spans.
+// Touch handles and keyboard extension retain their native paths.
 const controllers = new WeakMap()
 const hitTests = new WeakMap()
 const crossPageDocuments = new WeakSet()
@@ -13,6 +12,7 @@ export const setCrossPageSelection = (doc, active) => {
 }
 
 export const getPDFSelectionCaret = (doc, x, y) => {
+    if (!doc.defaultView) return null
     const hit = hitTests.get(doc)?.(x, y)
     if (hit) return hit
     const position = doc.caretPositionFromPoint?.(x, y)
@@ -26,22 +26,32 @@ export const getPDFSelectionCaret = (doc, x, y) => {
 export const setupOCRSelection = container => {
     const doc = container.ownerDocument
     controllers.get(doc)?.abort()
-    const reading = container.querySelector('[data-pdf-ocr-text]')
-    if (!reading || !doc.defaultView) return
-    const controller = new AbortController()
+    hitTests.delete(doc)
+    const reading = container.querySelector('[data-pdf-ocr-text]') ?? container
+    // A retiring iframe loses doc.defaultView before a late render can abort
+    // its previous handlers. Keep the original window for safe cancellation.
+    const win = doc.defaultView
+    if (!win) return
+    const controller = new win.AbortController()
     controllers.set(doc, controller)
     const options = { signal: controller.signal }
     let drag = null
+    let animation = null
+    let pending = null
+    let hitSnapshot = null
+    let hitAnimation = null
 
     const targetSpan = event => event.target?.closest?.('span')
     const supported = span => {
-        if (!span || !reading.contains(span)) return false
+        if (!doc.defaultView || !span || !reading.contains(span)) return false
         // The reader intentionally disables selection during instant annotation.
-        const style = doc.defaultView.getComputedStyle(span)
+        const style = win.getComputedStyle(span)
         return style.userSelect !== 'none' && style.webkitUserSelect !== 'none'
     }
-    const snapshot = () => Array.from(reading.querySelectorAll('span'), span =>
-        ({ span, box: span.getBoundingClientRect() }))
+    const snapshot = () => Array.from(reading.querySelectorAll('span'))
+        .filter(span => span.firstChild?.nodeType === 3 && span.textContent.length
+            && !span.hasAttribute('data-pdf-legacy'))
+        .map(span => ({ span, box: span.getBoundingClientRect() }))
     const caret = (items, x, y, cache) => {
         if (!items.length) return null
         const distance = box => Math.hypot(Math.max(box.top - y, 0, y - box.bottom),
@@ -55,8 +65,8 @@ export const setupOCRSelection = container => {
         if (!points) {
             points = []
             const range = doc.createRange()
-            const vertical = doc.defaultView.getComputedStyle(item.span).writingMode.startsWith('vertical')
-            let rtl = doc.defaultView.getComputedStyle(item.span).direction === 'rtl'
+            const vertical = win.getComputedStyle(item.span).writingMode.startsWith('vertical')
+            let rtl = win.getComputedStyle(item.span).direction === 'rtl'
             // Grapheme boundaries prevent splitting surrogate pairs or accents.
             for (const { index, segment } of new Intl.Segmenter(undefined,
                 { granularity: 'grapheme' }).segment(node.textContent)) {
@@ -78,28 +88,44 @@ export const setupOCRSelection = container => {
                 < Math.abs(best.position - (best.vertical ? y : x)) ? point : best)
         return { node, offset: nearest.offset }
     }
-    hitTests.set(doc, (x, y) => caret(snapshot(), x, y, new Map()))
+    hitTests.set(doc, (x, y) => {
+        // Cross-page coordination also asks for an endpoint while the mouse is
+        // moving. Reuse this gesture's measured page instead of laying out all
+        // text spans again for every pointer event.
+        if (drag) return caret(drag.items, x, y, drag.cache)
+        if (!hitSnapshot) {
+            hitSnapshot = { items: snapshot(), cache: new Map() }
+            hitAnimation = win.requestAnimationFrame(() => { hitSnapshot = null })
+        }
+        return caret(hitSnapshot.items, x, y, hitSnapshot.cache)
+    })
     const update = event => {
         if (!drag || crossPageDocuments.has(doc)) return
         const end = caret(drag.items, event.clientX, event.clientY, drag.cache)
         if (end) doc.getSelection()?.setBaseAndExtent(
             drag.start.node, drag.start.offset, end.node, end.offset)
     }
+    const cancelUpdate = () => {
+        if (animation != null) win.cancelAnimationFrame(animation)
+        animation = null
+        pending = null
+    }
     const stop = () => {
+        cancelUpdate()
         if (drag && reading.hasPointerCapture(drag.id)) reading.releasePointerCapture(drag.id)
         drag = null
     }
     reading.addEventListener('pointerdown', event => {
         if (event.button !== 0 || !event.isPrimary || event.pointerType !== 'mouse'
             || event.altKey || event.ctrlKey || event.metaKey || !supported(targetSpan(event))) return
-        const items = snapshot(), cache = new Map()
+        const { items, cache } = hitSnapshot ?? { items: snapshot(), cache: new Map() }
         let start = caret(items, event.clientX, event.clientY, cache)
         const selection = doc.getSelection()
         if (event.shiftKey && reading.contains(selection?.anchorNode))
             start = { node: selection.anchorNode, offset: selection.anchorOffset }
         if (!start) return
         event.preventDefault()
-        doc.defaultView.focus()
+        win.focus()
         drag = { start, items, cache, id: event.pointerId }
         reading.setPointerCapture(event.pointerId)
         update(event)
@@ -107,22 +133,50 @@ export const setupOCRSelection = container => {
     reading.addEventListener('pointermove', event => {
         if (!drag || event.pointerId !== drag.id) return
         event.preventDefault()
-        update(event)
+        pending = { clientX: event.clientX, clientY: event.clientY }
+        if (animation != null) return
+        animation = win.requestAnimationFrame(() => {
+            animation = null
+            const point = pending
+            pending = null
+            if (point) update(point)
+        })
     }, options)
     reading.addEventListener('pointerup', event => {
         if (!drag || event.pointerId !== drag.id) return
         event.preventDefault()
+        cancelUpdate()
         update(event)
         stop()
     }, options)
     reading.addEventListener('pointercancel', stop, options)
-    reading.addEventListener('lostpointercapture', () => { drag = null }, options)
-    doc.defaultView.addEventListener('blur', stop, options)
+    reading.addEventListener('lostpointercapture', () => { cancelUpdate(); drag = null }, options)
+    controller.signal.addEventListener('abort', () => {
+        stop()
+        if (hitAnimation != null) win.cancelAnimationFrame(hitAnimation)
+    }, { once: true })
+    win.addEventListener('blur', stop, options)
     doc.addEventListener('keydown', event => {
         if (event.key === 'Escape' && drag) {
             stop()
             doc.getSelection()?.removeAllRanges()
         }
+    }, options)
+    if (reading === container) reading.addEventListener('click', event => {
+        // A deliberate third click retains the browser's paragraph selection;
+        // ordinary press-drag gestures continue to use exact glyph endpoints.
+        if (event.detail !== 3 || event.button !== 0 || event.altKey
+            || event.ctrlKey || event.metaKey || event.shiftKey) return
+        const point = caret(snapshot(), event.clientX, event.clientY, new Map())
+        if (!point) return
+        const box = point.node.parentElement.getBoundingClientRect()
+        if (event.clientX < box.left || event.clientX > box.right
+            || event.clientY < box.top || event.clientY > box.bottom) return
+        event.preventDefault()
+        const selection = doc.getSelection()
+        selection.collapse(point.node, point.offset)
+        selection.modify('move', 'backward', 'paragraphboundary')
+        selection.modify('extend', 'forward', 'paragraphboundary')
     }, options)
     reading.addEventListener('dblclick', event => {
         // Pointer capture can retarget the compatibility dblclick to `reading`.

@@ -425,7 +425,7 @@ const renderPage = async (page, getImageBlob, ocr = null, prepareOCR, labels) =>
     const src = URL.createObjectURL(new Blob([data], { type: 'text/html' }))
     const onZoom = async ({ doc, scale, pageColors }) => {
         const generation = await render(page, doc, scale, pageColors, ocr)
-        if (generation == null || renderGenerations.get(doc) !== generation) return
+        if (generation == null || renderGenerations.get(doc) !== generation) return false
         const container = doc.querySelector('.textLayer')
         const publish = result => {
             const end = container.querySelector('.endOfContent')
@@ -441,7 +441,7 @@ const renderPage = async (page, getImageBlob, ocr = null, prepareOCR, labels) =>
         if (ocr && !container?.textContent?.trim()) publish(ocr)
         if (!prepareOCR || ocr || container?.textContent?.trim()) {
             doc.querySelector('[data-pdf-ocr-status]')?.remove()
-            return
+            return true
         }
         const current = () => Boolean(doc.defaultView?.frameElement?.isConnected)
         if (!current()) return
@@ -467,6 +467,7 @@ const renderPage = async (page, getImageBlob, ocr = null, prepareOCR, labels) =>
             if (current() && renderGenerations.get(doc) === generation)
                 status.textContent = labels?.failed ?? 'Page text could not be recognized.'
         })
+        return true
     }
     return { src, data, onZoom }
 }

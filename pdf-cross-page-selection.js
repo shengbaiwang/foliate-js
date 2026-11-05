@@ -14,6 +14,15 @@ const pointFromSelection = (doc, index, selection, side) => {
     const node = selection?.[`${side}Node`], offset = selection?.[`${side}Offset`]
     return node?.nodeType === 3 && textNodes(doc).includes(node) ? { doc, index, node, offset } : null
 }
+const frameGeometry = doc => {
+    const frame = doc.defaultView?.frameElement
+    if (!frame) return null
+    const rect = frame.getBoundingClientRect()
+    const width = frame.clientWidth || rect.width, height = frame.clientHeight || rect.height
+    // Resize previews scale the existing iframe while its text coordinates
+    // remain in the original viewport. Keep outer points in screen CSS pixels.
+    return { rect, width, height, scaleX: rect.width / width || 1, scaleY: rect.height / height || 1 }
+}
 
 // Keep the page documents and their existing CFIs. A cross-page selection is
 // an ordered set of real Ranges, never a Range spanning unrelated documents.
@@ -165,12 +174,17 @@ export class PDFCrossPageSelection {
         range.setStart(point.node, segment.index)
         range.setEnd(point.node, segment.index + segment.segment.length)
         const box = range.getBoundingClientRect()
-        const frame = point.doc.defaultView.frameElement.getBoundingClientRect()
+        const frame = frameGeometry(point.doc)
+        if (!frame) return
+        const left = frame.rect.left + box.left * frame.scaleX
+        const right = frame.rect.left + box.right * frame.scaleX
+        const top = frame.rect.top + box.top * frame.scaleY
+        const bottom = frame.rect.top + box.bottom * frame.scaleY
         const host = this.#view.renderer.getBoundingClientRect()
-        const dx = frame.left + box.left < host.left + 16 ? frame.left + box.left - host.left - 16
-            : frame.left + box.right > host.right - 16 ? frame.left + box.right - host.right + 16 : 0
-        const dy = frame.top + box.top < host.top + 16 ? frame.top + box.top - host.top - 16
-            : frame.top + box.bottom > host.bottom - 16 ? frame.top + box.bottom - host.bottom + 16 : 0
+        const dx = left < host.left + 16 ? left - host.left - 16
+            : right > host.right - 16 ? right - host.right + 16 : 0
+        const dy = top < host.top + 16 ? top - host.top - 16
+            : bottom > host.bottom - 16 ? bottom - host.bottom + 16 : 0
         if (dx || dy) this.#view.renderer.scrollBy({ left: dx, top: dy, behavior: 'auto' })
     }
     #savePoint(point) {
@@ -254,9 +268,12 @@ export class PDFCrossPageSelection {
     }
     #rememberPoint(event) {
         const drag = this.#drag
-        const source = drag?.doc.defaultView?.frameElement?.getBoundingClientRect()
+        const source = drag && frameGeometry(drag.doc)
         if (!source) return
-        drag.point = { x: source.left + event.clientX, y: source.top + event.clientY }
+        drag.point = {
+            x: source.rect.left + event.clientX * source.scaleX,
+            y: source.rect.top + event.clientY * source.scaleY,
+        }
     }
     #scroll = time => {
         const drag = this.#drag
@@ -356,6 +373,9 @@ export class PDFCrossPageSelection {
                 drag.captured = true
             }
         }
+        // Most movement belongs to the page's native Selection handler. Only
+        // inspect other iframe layouts once the pointer reaches a page edge.
+        if (!drag?.captured && !drag?.crossed) return
         if (this.#updateAtPoint()) event.preventDefault()
     }
     #updateAtPoint() {
@@ -373,13 +393,15 @@ export class PDFCrossPageSelection {
         const distance = rect => Math.max(rect.left - x, 0, x - rect.right)
             + Math.max(rect.top - y, 0, y - rect.bottom)
         const target = contents.reduce((best, item) => {
-            const rect = item.doc.defaultView.frameElement.getBoundingClientRect()
-            return !best || distance(rect) < best.distance ? { ...item, rect, distance: distance(rect) } : best
+            const frame = frameGeometry(item.doc)
+            if (!frame) return best
+            const { rect } = frame
+            return !best || distance(rect) < best.distance ? { ...item, ...frame, distance: distance(rect) } : best
         }, null)
-        if (!target || (!drag.crossed && !drag.captured && target.index === drag.index)) return
+        if (!target || (!drag.crossed && target.index === drag.index)) return
         const end = getPDFSelectionCaret(target.doc,
-            Math.max(0, Math.min(target.rect.width - 1, x - target.rect.left)),
-            Math.max(0, Math.min(target.rect.height - 1, y - target.rect.top)))
+            Math.max(0, Math.min(target.width - 1, (x - target.rect.left) / target.scaleX)),
+            Math.max(0, Math.min(target.height - 1, (y - target.rect.top) / target.scaleY)))
         if (!end) return
         const selected = this.#selectBetween(drag.anchor ?? { ...drag.start, doc: drag.doc, index: drag.index }, { ...end, doc: target.doc, index: target.index })
         if (selected) drag.crossed = true

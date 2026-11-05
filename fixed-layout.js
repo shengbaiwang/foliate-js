@@ -188,7 +188,10 @@ export const computeSpreadInlineMargins = (portrait) => portrait
 export const applyOverlayerViewBox = (frame, overlayer) => {
     if (!overlayer?.element) return
     const el = overlayer.element
-    if (frame?.onZoom) {
+    if (frame?.onZoom && frame.drawScale && frame.layoutScale !== frame.drawScale) {
+        el.setAttribute('viewBox', `0 0 ${frame.width * frame.drawScale} ${frame.height * frame.drawScale}`)
+        el.setAttribute('preserveAspectRatio', 'none')
+    } else if (frame?.onZoom) {
         el.removeAttribute('viewBox')
         el.removeAttribute('preserveAspectRatio')
     } else {
@@ -202,9 +205,15 @@ export const applyOverlayerViewBox = (frame, overlayer) => {
 }
 
 export class FixedLayout extends HTMLElement {
-    static observedAttributes = ['zoom', 'scale-factor', 'spread', 'flow', 'scroll-gap', 'scroll-direction']
+    static observedAttributes = ['zoom', 'scale-factor', 'zoom-preview', 'spread', 'flow', 'scroll-gap', 'scroll-direction']
     #root = this.attachShadow({ mode: 'open' })
-    #observer = new ResizeObserver(() => this.#render())
+    #observer = new ResizeObserver(() => this.#scheduleResize())
+    #resizeFrame = null
+    #resizeTimer = null
+    #resizing = false
+    #resizeWidth = -1
+    #resizeHeight = -1
+    #destroyed = false
     #spreads
     #index = -1
     defaultViewport
@@ -438,6 +447,77 @@ export class FixedLayout extends HTMLElement {
             }, 150)
         })
     }
+    #scheduleResize() {
+        if (this.#destroyed) return
+        const { width, height } = this.getBoundingClientRect()
+        if (width === this.#resizeWidth && height === this.#resizeHeight) return
+        this.#resizeWidth = width
+        this.#resizeHeight = height
+        this.#resizing = true
+        // Keep the existing bitmap, text and highlights aligned as a single
+        // preview. Rasterising every intermediate window size repeatedly
+        // cancels PDF.js tasks and replaces selectable text while dragging.
+        if (this.#resizeFrame === null) this.#resizeFrame = requestAnimationFrame(() => {
+            this.#resizeFrame = null
+            this.#render()
+        })
+        clearTimeout(this.#resizeTimer)
+        this.#resizeTimer = setTimeout(() => {
+            this.#resizeTimer = null
+            this.#resizing = false
+            this.#render()
+        }, 100)
+    }
+    #layoutPDFFrame(frame) {
+        const scale = frame.layoutScale
+        const drawn = frame.drawScale ?? scale
+        Object.assign(frame.iframe.style, {
+            position: 'absolute',
+            top: '0',
+            left: '0',
+            width: `${frame.width * drawn}px`,
+            height: `${frame.height * drawn}px`,
+            transform: scale === drawn ? 'none' : `scale(${scale / drawn})`,
+            transformOrigin: 'top left',
+            display: frame.blank ? 'none' : 'block',
+        })
+        const index = Number(frame.iframe.dataset.sectionIndex)
+        const overlayer = this.#overlayers.get(index)
+        if (overlayer) {
+            applyOverlayerViewBox(frame, overlayer)
+            overlayer.redraw()
+        }
+    }
+    #drawPDFFrame(frame, scale) {
+        frame.layoutScale = scale
+        this.#layoutPDFFrame(frame)
+        // A newly loaded page still needs its first drawing during a resize.
+        if ((this.#resizing || this.hasAttribute('zoom-preview')) && frame.drawScale != null)
+            return frame.renderPromise
+        const doc = frame.iframe.contentDocument
+        const colors = JSON.stringify(this.#pageColors)
+        const previous = frame.drawRequest
+        if (previous?.doc === doc && previous.scale === scale && previous.colors === colors)
+            return frame.renderPromise
+        const request = { doc, scale, colors }
+        frame.drawRequest = request
+        frame.renderPromise = Promise.resolve(frame.onZoom({
+            doc, scale, pageColors: this.#pageColors,
+        })).then(result => {
+            if (this.#destroyed || frame.drawRequest !== request || !frame.iframe.isConnected) return
+            if (result === false) {
+                frame.drawRequest = null
+                return
+            }
+            frame.drawScale = scale
+            this.#refreshOverlayerForFrame(frame)
+            this.#layoutPDFFrame(frame)
+        }).catch(error => {
+            if (frame.drawRequest === request) frame.drawRequest = null
+            throw error
+        })
+        return frame.renderPromise
+    }
     attributeChangedCallback(name, _, value) {
         switch (name) {
             case 'zoom':
@@ -448,6 +528,9 @@ export class FixedLayout extends HTMLElement {
             case 'scale-factor':
                 this.#scaleFactor = parseFloat(value) / 100
                 this.#render()
+                break
+            case 'zoom-preview':
+                if (value === null) this.#render()
                 break
             case 'spread':
                 this.#respread(value)
@@ -520,20 +603,21 @@ export class FixedLayout extends HTMLElement {
         return new Promise(resolve => {
             iframe.addEventListener('load', () => {
                 const doc = iframe.contentDocument
-                doc.addEventListener('pdf-text-ready', () => {
-                    const frame = { iframe, onZoom, element }
-                    this.#refreshOverlayerForFrame(frame)
-                })
                 iframe.dataset.sectionIndex = index
                 this.dispatchEvent(new CustomEvent('load', { detail: { doc, index } }))
                 const { width, height } = getViewport(doc, this.defaultViewport)
-                resolve({
+                const frame = {
                     element, iframe,
                     width: parseFloat(width),
                     height: parseFloat(height),
                     onZoom,
                     detached,
+                }
+                doc.addEventListener('pdf-text-ready', () => {
+                    this.#refreshOverlayerForFrame(frame)
+                    if (frame.layoutScale) this.#layoutPDFFrame(frame)
                 })
+                resolve(frame)
             }, { once: true })
             if (data) {
                 iframe.srcdoc = data
@@ -584,15 +668,8 @@ export class FixedLayout extends HTMLElement {
             let { element, iframe, width, height, blank, onZoom } = frame
             if (!iframe) return
             if (onZoom) {
-                const p = onZoom({ doc: frame.iframe.contentDocument, scale, pageColors: this.#pageColors })
-                if (p?.then) {
-                    // onZoom (e.g. pdf.js) may rebuild the text layer DOM,
-                    // invalidating Range objects stored in the overlayer. After
-                    // the rebuild, re-emit create-overlayer so listeners can
-                    // re-anchor annotations against the fresh DOM.
-                    const refreshed = p.then(() => this.#refreshOverlayerForFrame(frame))
-                    renderPromises.push(refreshed)
-                }
+                const p = this.#drawPDFFrame(frame, scale)
+                if (p?.then) renderPromises.push(p)
             }
             const iframeScale = onZoom ? scale : 1
             const zoomedOut = this.#scaleFactor < 1.0
@@ -603,7 +680,7 @@ export class FixedLayout extends HTMLElement {
             // pushes it out of view and blanks the page (#4857). Keep those in
             // normal block flow at every zoom.
             const centerInBox = zoomedOut && onZoom
-            Object.assign(iframe.style, {
+            if (!onZoom) Object.assign(iframe.style, {
                 width: `${width * iframeScale}px`,
                 height: `${height * iframeScale}px`,
                 transform: onZoom ? 'none' : `scale(${scale})`,
@@ -637,11 +714,7 @@ export class FixedLayout extends HTMLElement {
                         width: `${(width ?? blankWidth) * scale}px`,
                         height: `${(height ?? blankHeight) * scale}px`,
                     })
-                    applyOverlayerViewBox({
-                        onZoom,
-                        width: width ?? blankWidth,
-                        height: height ?? blankHeight,
-                    }, overlayer)
+                    applyOverlayerViewBox(frame, overlayer)
                     overlayer.redraw()
                 }
             }
@@ -1003,19 +1076,20 @@ export class FixedLayout extends HTMLElement {
         return new Promise(resolve => {
             iframe.addEventListener('load', () => {
                 const doc = iframe.contentDocument
-                doc.addEventListener('pdf-text-ready', () => {
-                    const frame = { iframe, onZoom, element }
-                    this.#refreshOverlayerForFrame(frame)
-                })
                 iframe.dataset.sectionIndex = pageData.index
                 this.dispatchEvent(new CustomEvent('load', { detail: { doc, index: pageData.index } }))
                 const { width, height } = getViewport(doc, this.defaultViewport)
-                resolve({
+                const frame = {
                     element, iframe,
                     width: parseFloat(width),
                     height: parseFloat(height),
                     onZoom,
+                }
+                doc.addEventListener('pdf-text-ready', () => {
+                    this.#refreshOverlayerForFrame(frame)
+                    if (frame.layoutScale) this.#layoutPDFFrame(frame)
                 })
+                resolve(frame)
             }, { once: true })
             if (data) {
                 iframe.srcdoc = data
@@ -1178,7 +1252,7 @@ export class FixedLayout extends HTMLElement {
             page.el.style.width = `${page.vpWidth * scale}px`
             page.el.style.height = `${page.vpHeight * scale}px`
             if (page.state === 'loaded' && page.frame) {
-                this.#renderScrollPage(page)
+                this.#renderScrollPage(page, { width: hostWidth, height: hostHeight })
             }
         }
         if (pinchAnchor) {
@@ -1188,24 +1262,14 @@ export class FixedLayout extends HTMLElement {
             this.#restoreScrollModeAnchor(scrollAnchor)
         }
     }
-    #renderScrollPage(pageData) {
-        const { width: hostWidth, height: hostHeight } = this.getBoundingClientRect()
+    #renderScrollPage(pageData, host = this.getBoundingClientRect()) {
+        const { width: hostWidth, height: hostHeight } = host
         if (!(this.#scrollHorizontal ? hostHeight : hostWidth) || !pageData.frame) return
         const { vpWidth: vw, vpHeight: vh, frame } = pageData
-        const scale = this.#scrollPageScale(vw, vh)
+        const scale = this.#scrollPageScale(vw, vh, host)
 
         if (frame.onZoom) {
-            frame.renderPromise = Promise.resolve(frame.onZoom({
-                doc: frame.iframe.contentDocument, scale, pageColors: this.#pageColors,
-            })).then(() => {
-                if (pageData.frame === frame) this.#refreshOverlayerForFrame(frame)
-            })
-            Object.assign(frame.iframe.style, {
-                width: `${vw * scale}px`,
-                height: `${vh * scale}px`,
-                transform: 'none',
-                display: 'block',
-            })
+            this.#drawPDFFrame(frame, scale)
         } else {
             Object.assign(frame.iframe.style, {
                 width: `${vw}px`,
@@ -1575,10 +1639,7 @@ export class FixedLayout extends HTMLElement {
                     index: this.book.sections.indexOf(section), src, detached: true,
                 })
                 frames[side] = frame
-                if (frame.onZoom) await frame.onZoom({
-                    doc: frame.iframe.contentDocument,
-                    scale: this.#totalScaleFactor, pageColors: this.#pageColors,
-                })
+                if (frame.onZoom) await this.#drawPDFFrame(frame, this.#totalScaleFactor)
             }
             this.#preloadCache.set(key, sources)
             this.#prerenderedSpreads.set(key, frames)
@@ -1929,8 +1990,11 @@ export class FixedLayout extends HTMLElement {
         return 'width'
     }
     destroy() {
+        this.#destroyed = true
+        if (this.#resizeFrame !== null) cancelAnimationFrame(this.#resizeFrame)
+        clearTimeout(this.#resizeTimer)
         clearTimeout(this.#paginatedLocationTimer)
-        this.#observer.unobserve(this)
+        this.#observer.disconnect()
         if (this.#scrollMode) {
             this.removeEventListener('scroll', this.#handleScrollEvent)
             this.removeEventListener('wheel', this.#handleScrollWheel)

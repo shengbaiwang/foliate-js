@@ -96,12 +96,42 @@ export const appendOCR = (container, page, viewport) => {
     // Batch layout reads before writes. Actual DOM font metrics (including CJK
     // fallback and trailing spaces) match native caret/Range geometry; font size
     // alone describes neither the glyph box nor the browser's selection box.
-    const origin = reading.getBoundingClientRect()
-    const metrics = spans.map(span => {
+    let origin = reading.getBoundingClientRect()
+    let metrics = spans.map(span => {
         const range = doc.createRange()
         range.selectNodeContents(span)
         return range.getBoundingClientRect()
     })
+    if (doc.defaultView && metrics.some(box => !box.width || !box.height)) {
+        // A display:none ancestor suppresses layout inside preloaded iframes.
+        // Measure copies in a visible ancestor document, keeping the original
+        // word nodes and CFI order untouched. visibility:hidden still lays out.
+        let measurementDoc = doc
+        while (measurementDoc.defaultView?.frameElement?.ownerDocument)
+            measurementDoc = measurementDoc.defaultView.frameElement.ownerDocument
+        const host = measurementDoc.createElement('div')
+        host.style.cssText = 'all:initial;position:fixed;left:0;top:0;visibility:hidden;pointer-events:none;contain:layout style'
+        const root = host.attachShadow({ mode: 'closed' })
+        const copies = spans.map(span => {
+            const copy = span.cloneNode(true)
+            const computed = doc.defaultView.getComputedStyle(span)
+            for (const key of ['fontFamily', 'fontSize', 'fontWeight', 'fontStyle',
+                'fontStretch', 'fontVariant', 'fontFeatureSettings', 'fontVariationSettings',
+                'fontKerning', 'letterSpacing', 'wordSpacing', 'lineHeight', 'direction'])
+                copy.style[key] = computed[key]
+            root.append(copy)
+            return copy
+        })
+        measurementDoc.body.append(host)
+        try {
+            origin = host.getBoundingClientRect()
+            metrics = copies.map(copy => {
+                const range = measurementDoc.createRange()
+                range.selectNodeContents(copy)
+                return range.getBoundingClientRect()
+            })
+        } finally { host.remove() }
+    }
     const styles = new Map()
     ordered.forEach((word, i) => {
         const box = metrics[i]

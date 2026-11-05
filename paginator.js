@@ -1385,7 +1385,24 @@ export class Paginator extends HTMLElement {
         'no-preload', 'no-background', 'no-continuous-scroll',
     ]
     #root = this.attachShadow({ mode: 'open' })
-    #observer = new ResizeObserver(() => this.render())
+    #resizeFrame = null
+    #resizeWidth = -1
+    #resizeHeight = -1
+    #observer = new ResizeObserver(([entry]) => {
+        if (!entry) return
+        const { width, height } = entry.contentRect
+        if (width === this.#resizeWidth && height === this.#resizeHeight) return
+        this.#resizeWidth = width
+        this.#resizeHeight = height
+        // A render can change the observed container's column layout. Combine
+        // those notifications and live window resizing before the next paint;
+        // explicit render() calls for settings/navigation stay synchronous.
+        if (this.#resizeFrame !== null) return
+        this.#resizeFrame = requestAnimationFrame(() => {
+            this.#resizeFrame = null
+            this.render()
+        })
+    })
     #top
     #background
     #container
@@ -3967,7 +3984,11 @@ export class Paginator extends HTMLElement {
             this.#vtCleanup()
             this.#isAnimating = false
         }
-        this.#observer.unobserve(this)
+        this.#observer.disconnect()
+        if (this.#resizeFrame !== null) {
+            cancelAnimationFrame(this.#resizeFrame)
+            this.#resizeFrame = null
+        }
         this.#destroyAllViews()
         this.#mediaQuery.removeEventListener('change', this.#mediaQueryListener)
     }
