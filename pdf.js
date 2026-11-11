@@ -216,7 +216,7 @@ const getRenderDpr = (page, zoom) => {
     return Math.max(1, dpr)
 }
 
-const render = async (page, doc, zoom, pageColors, ocr) => {
+const render = async (page, doc, zoom, pageColors, ocr, onCommit) => {
     if (!doc) return
 
     // Increment generation to invalidate any in-progress render for this doc
@@ -315,7 +315,6 @@ const render = async (page, doc, zoom, pageColors, ocr) => {
         if (renderGenerations.get(doc) !== generation) return
         appendOCR(staged, ocr, displayViewport)
         const oldCanvas = canvasElement.querySelector('canvas')
-        if (oldCanvas) oldCanvas.width = oldCanvas.height = 0
         canvasElement.replaceChildren(doc.adoptNode(canvas))
         staged.style.removeProperty('visibility')
         staged.style.removeProperty('pointer-events')
@@ -325,6 +324,11 @@ const render = async (page, doc, zoom, pageColors, ocr) => {
         doc.documentElement.style.setProperty('--user-unit', '1')
         doc.documentElement.style.setProperty('--scale-round-x', '1px')
         doc.documentElement.style.setProperty('--scale-round-y', '1px')
+        // The iframe must change its drawn coordinate system in this same
+        // task. Waiting for annotations leaves the new bitmap under the old
+        // preview transform for one or more painted frames (double scaling).
+        onCommit?.()
+        if (oldCanvas) oldCanvas.width = oldCanvas.height = 0
     } catch (error) {
         if (renderGenerations.get(doc) === generation) throw error
         return
@@ -423,8 +427,8 @@ const renderPage = async (page, getImageBlob, ocr = null, prepareOCR, labels) =>
         <div class="annotationLayer"></div>
     `
     const src = URL.createObjectURL(new Blob([data], { type: 'text/html' }))
-    const onZoom = async ({ doc, scale, pageColors }) => {
-        const generation = await render(page, doc, scale, pageColors, ocr)
+    const onZoom = async ({ doc, scale, pageColors, onCommit }) => {
+        const generation = await render(page, doc, scale, pageColors, ocr, onCommit)
         if (generation == null || renderGenerations.get(doc) !== generation) return false
         const container = doc.querySelector('.textLayer')
         const publish = result => {

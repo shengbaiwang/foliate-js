@@ -205,7 +205,7 @@ export const applyOverlayerViewBox = (frame, overlayer) => {
 }
 
 export class FixedLayout extends HTMLElement {
-    static observedAttributes = ['zoom', 'scale-factor', 'zoom-preview', 'spread', 'flow', 'scroll-gap', 'scroll-direction']
+    static observedAttributes = ['zoom', 'scale-factor', 'zoom-preview', 'fit-viewport', 'spread', 'flow', 'scroll-gap', 'scroll-direction']
     #root = this.attachShadow({ mode: 'open' })
     #observer = new ResizeObserver(() => this.#scheduleResize())
     #resizeFrame = null
@@ -274,6 +274,266 @@ export class FixedLayout extends HTMLElement {
     // lands where the preview showed it. Using the real getBoundingClientRect
     // (not fraction maths) sidesteps gap/page-boundary and header-offset errors.
     #pinchAnchor = null
+    #zoomPoint = null
+    #clampedZoomAnchor = null
+    #zoomGesture = null
+    #zoomFrame = null
+    #zoomTimer = null
+    #zoomDocuments = new WeakSet()
+    #hostZoomBlur = null
+    #writingGesture = false
+    #batchZoom = false
+    #fitViewport = { x: 0, y: 0, width: 1, height: 1 }
+    #panning = false
+    #cancelGesture() {
+        if (!this.#zoomGesture) return
+        clearTimeout(this.#zoomTimer)
+        cancelAnimationFrame(this.#zoomFrame)
+        this.#zoomFrame = null
+        this.#zoom = this.#zoomGesture.zoom
+        this.#scaleFactor = this.#zoomGesture.factor
+        this.#zoomGesture = null
+        this.removeAttribute('zoom-preview')
+        this.#zoomPoint = null
+    }
+    #retainedZoomAnchor() {
+        const saved = this.#clampedZoomAnchor
+        if (!saved) return null
+        const host = this.getBoundingClientRect()
+        if (saved.anchor.el.isConnected && (!this.#zoomPoint || (saved.anchor.x === this.#zoomPoint.x && saved.anchor.y === this.#zoomPoint.y))
+            && Math.abs(this.scrollTop - saved.top) < 1
+            && Math.abs(this.scrollLeft - saved.left) < 1
+            && ['left', 'top', 'width', 'height'].every(key => Math.abs(host[key] - saved.host[key]) < 1))
+            return saved.anchor
+        this.#clampedZoomAnchor = null
+        return null
+    }
+    #captureVisualAnchor() {
+        const retained = this.#retainedZoomAnchor()
+        if (retained) return retained
+        const host = this.getBoundingClientRect()
+        const point = this.#zoomPoint ?? {
+            x: host.left + this.clientWidth / 2,
+            y: host.top + this.clientHeight / 2,
+        }
+        const frames = this.#scrollMode
+            ? this.#scrollPages.filter(p => p.frame?.onZoom).map(p => p.frame)
+            : [this.#center, this.#left, this.#right].filter(f => f?.onZoom)
+        let nearest, distance = Infinity
+        for (const frame of frames) {
+            const el = frame.element, rect = el.getBoundingClientRect()
+            if (!rect.width || !rect.height || el.style.visibility === 'hidden') continue
+            const d = Math.hypot(Math.max(rect.left - point.x, 0, point.x - rect.right),
+                Math.max(rect.top - point.y, 0, point.y - rect.bottom))
+            if (d < distance) {
+                distance = d
+                nearest = { el, index: Number(frame.iframe.dataset.sectionIndex), x: point.x, y: point.y,
+                    u: (point.x - rect.left) / rect.width,
+                    v: (point.y - rect.top) / rect.height }
+            }
+        }
+        return nearest
+    }
+    #restoreVisualAnchor(anchor) {
+        if (!anchor?.el.isConnected) return
+        const rect = anchor.el.getBoundingClientRect()
+        const maxLeft = Math.max(0, this.scrollWidth - this.clientWidth)
+        const rtl = getComputedStyle(this).direction === 'rtl'
+        const requestedLeft = this.scrollLeft + rect.left + rect.width * anchor.u - anchor.x
+        const requestedTop = this.scrollTop + rect.top + rect.height * anchor.v - anchor.y
+        const left = clamp(requestedLeft, rtl ? -maxLeft : 0, rtl ? 0 : maxLeft)
+        const top = clamp(requestedTop, 0, Math.max(0, this.scrollHeight - this.clientHeight))
+        // An unchanged scroll assignment cancels native smooth scrolling.
+        if (Math.abs(left - this.scrollLeft) > 0.5) this.scrollLeft = left
+        if (Math.abs(top - this.scrollTop) > 0.5) this.scrollTop = top
+        // Tiny pages cannot keep the reading point physically under the viewport
+        // centre. Retain it until scrolling/navigation changes it, so zooming back
+        // restores the same page instead of anchoring to a different tiny page.
+        this.#clampedZoomAnchor = Math.abs(left - requestedLeft) > 1 || Math.abs(top - requestedTop) > 1
+            ? { anchor, top: this.scrollTop, left: this.scrollLeft, host: this.getBoundingClientRect() }
+            : null
+        if (this.#scrollMode) this.#scrollCurrentIndex = this.#getScrollIndex()
+    }
+    #previewGesture(level, point) {
+        if (this.#destroyed || !Number.isFinite(level)) return
+        if (!this.#zoomGesture) this.#zoomGesture = {
+            start: this.scale * 100, zoom: this.#zoom, factor: this.#scaleFactor,
+        }
+        this.#zoomGesture.level = clamp(level, 5, 500)
+        this.#zoomPoint ??= point
+        this.setAttribute('zoom-preview', '')
+        if (this.#zoomFrame === null) this.#zoomFrame = requestAnimationFrame(() => {
+            this.#zoomFrame = null
+            this.#applyGesture()
+        })
+    }
+    #applyGesture() {
+        if (!this.#zoomGesture) return
+        // Absolute PDF scale: changing the fit mode must not introduce an
+        // intermediate layout (or its clamped scroll position).
+        this.#zoom = 1
+        this.#scaleFactor = this.#zoomGesture.level / 100
+        this.#render()
+    }
+    #finishGesture = () => {
+        if (!this.#zoomGesture) { this.#zoomPoint = null; return }
+        clearTimeout(this.#zoomTimer)
+        cancelAnimationFrame(this.#zoomFrame)
+        this.#zoomFrame = null
+        this.#zoomGesture.level = Math.round(this.#zoomGesture.level)
+        this.#applyGesture()
+        this.#writingGesture = true
+        this.setAttribute('zoom', 'original-size')
+        this.setAttribute('scale-factor', this.#zoomGesture.level)
+        this.#writingGesture = false
+        this.#zoomGesture = null
+        this.removeAttribute('zoom-preview')
+        this.#zoomPoint = null
+        if (this.#scrollMode) this.#scheduleScrollPages()
+        this.dispatchEvent(new CustomEvent('pdf-zoom-commit', {
+            detail: { level: Math.round(this.scale * 100) },
+        }))
+    }
+    #attachPDFZoom(target) {
+        if (this.#zoomDocuments.has(target)) return
+        this.#zoomDocuments.add(target)
+        const point = e => {
+            const iframe = target.defaultView?.frameElement
+            if (!iframe) return { x: e.clientX, y: e.clientY }
+            const rect = iframe.getBoundingClientRect()
+            return { x: rect.left + e.clientX * rect.width / iframe.clientWidth,
+                y: rect.top + e.clientY * rect.height / iframe.clientHeight }
+        }
+        const consume = e => { e.preventDefault(); e.stopImmediatePropagation() }
+        if (target === this) {
+            this.tabIndex = -1
+            this.addEventListener('pointerdown', e => {
+                if (e.pointerType === 'mouse' && e.button === 0) this.focus({ preventScroll: true })
+            }, true)
+        }
+        let space = false, pan = null, suppressClick = false, usedPan = false, replayingSpace = false
+        const surface = target.documentElement ?? target
+        const cursor = value => {
+            surface.style.cursor = value
+            if (target.documentElement) {
+                target.documentElement.toggleAttribute('data-pdf-pan', !!value)
+            }
+        }
+        if (target.head) {
+            const style = target.createElement('style')
+            style.setAttribute('cfi-inert', '')
+            style.textContent = 'html[data-pdf-pan] * { cursor: inherit !important; user-select: none !important; }'
+            target.head.append(style)
+        }
+        const editable = e => e.target?.closest?.('input,textarea,select,button,a,[contenteditable="true"]')
+        const stopPan = e => {
+            if (!pan || (e?.pointerId != null && e.pointerId !== pan.id)) return
+            const capture = pan.capture
+            const id = pan.id
+            pan = null
+            this.#panning = false
+            if (capture.hasPointerCapture?.(id)) capture.releasePointerCapture(id)
+            cursor(space ? 'grab' : '')
+            if (this.#scrollMode) this.#scheduleScrollPages()
+        }
+        target.addEventListener('keydown', e => {
+            if (replayingSpace || e.code !== 'Space' || e.ctrlKey || e.metaKey || e.altKey || editable(e)) return
+            consume(e)
+            if (!space) usedPan = false
+            space = true
+            cursor(pan ? 'grabbing' : 'grab')
+        }, true)
+        target.addEventListener('keyup', e => {
+            if (e.code !== 'Space' || !space) return
+            consume(e)
+            space = false
+            if (!pan) cursor('')
+            // A plain Space tap retains the configured reading shortcut. Only
+            // Space used for a drag belongs to the temporary grab interaction.
+            if (!usedPan) {
+                replayingSpace = true
+                try { e.target.dispatchEvent(new KeyboardEvent('keydown', {
+                    key: ' ', code: 'Space', shiftKey: e.shiftKey,
+                    bubbles: true, cancelable: true,
+                })) } finally { replayingSpace = false }
+            }
+        }, true)
+        target.addEventListener('pointerdown', e => {
+            if (this.#destroyed || pan || e.pointerType === 'touch' || (!space && e.button !== 1)) return
+            if (e.button !== 0 && e.button !== 1) return
+            consume(e)
+            this.#finishGesture()
+            this.#panning = true
+            usedPan = true
+            suppressClick = true
+            const capture = target.documentElement ?? target
+            const origin = point(e)
+            pan = { id: e.pointerId, x: origin.x, y: origin.y,
+                left: this.scrollLeft, top: this.scrollTop, capture }
+            capture.setPointerCapture(e.pointerId)
+            cursor('grabbing')
+        }, true)
+        target.addEventListener('pointermove', e => {
+            if (!pan || e.pointerId !== pan.id) return
+            consume(e)
+            const current = point(e)
+            this.scrollLeft = pan.left - (current.x - pan.x)
+            this.scrollTop = pan.top - (current.y - pan.y)
+        }, true)
+        for (const type of ['pointerup', 'pointercancel', 'lostpointercapture']) {
+            target.addEventListener(type, e => {
+                if (!pan || e.pointerId !== pan.id) return
+                consume(e)
+                stopPan(e)
+            }, true)
+        }
+        for (const type of ['click', 'auxclick']) target.addEventListener(type, e => {
+            if (!suppressClick) return
+            consume(e)
+            suppressClick = false
+        }, true)
+        target.addEventListener('pointerdown', () => { if (!pan) suppressClick = false }, true)
+        const onBlur = () => {
+            space = false
+            stopPan()
+            cursor('')
+            this.#finishGesture()
+        }
+        if (target === this) {
+            this.#hostZoomBlur = onBlur
+            this.ownerDocument.defaultView.addEventListener('blur', onBlur)
+        } else target.defaultView?.addEventListener('blur', onBlur)
+
+        target.addEventListener('wheel', e => {
+            if (!e.ctrlKey || this.#destroyed) return
+            consume(e)
+            if (start !== null || !Number.isFinite(e.deltaY)) return
+            const delta = e.deltaY * (e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? this.clientHeight : 1)
+            const level = this.#zoomGesture?.level ?? this.scale * 100
+            this.#previewGesture(level * Math.exp(-clamp(delta, -150, 150) * 0.002), point(e))
+            clearTimeout(this.#zoomTimer)
+            this.#zoomTimer = setTimeout(this.#finishGesture, 160)
+        }, { capture: true, passive: false })
+        let start = null
+        target.addEventListener('gesturestart', e => {
+            if (this.#destroyed) return
+            consume(e)
+            this.#finishGesture()
+            start = this.scale * 100
+            this.#zoomPoint = point(e)
+        }, { capture: true, passive: false })
+        target.addEventListener('gesturechange', e => {
+            if (start === null || this.#destroyed) return
+            consume(e)
+            this.#previewGesture(start * e.scale, this.#zoomPoint)
+        }, { capture: true, passive: false })
+        target.addEventListener('gestureend', e => {
+            if (start === null) return
+            consume(e)
+            start = null
+            this.#finishGesture()
+        }, { capture: true, passive: false })
+    }
     #captureCenterPageRect() {
         const hostRect = this.getBoundingClientRect()
         const c = this.#scrollHorizontal
@@ -501,17 +761,23 @@ export class FixedLayout extends HTMLElement {
             return frame.renderPromise
         const request = { doc, scale, colors }
         frame.drawRequest = request
+        let committed = false
+        const onCommit = () => {
+            if (committed || this.#destroyed || frame.drawRequest !== request || !frame.iframe.isConnected) return
+            committed = true
+            frame.drawScale = scale
+            this.#refreshOverlayerForFrame(frame)
+            this.#layoutPDFFrame(frame)
+        }
         frame.renderPromise = Promise.resolve(frame.onZoom({
-            doc, scale, pageColors: this.#pageColors,
+            doc, scale, pageColors: this.#pageColors, onCommit,
         })).then(result => {
             if (this.#destroyed || frame.drawRequest !== request || !frame.iframe.isConnected) return
             if (result === false) {
                 frame.drawRequest = null
                 return
             }
-            frame.drawScale = scale
-            this.#refreshOverlayerForFrame(frame)
-            this.#layoutPDFFrame(frame)
+            onCommit()
         }).catch(error => {
             if (frame.drawRequest === request) frame.drawRequest = null
             throw error
@@ -519,15 +785,22 @@ export class FixedLayout extends HTMLElement {
         return frame.renderPromise
     }
     attributeChangedCallback(name, _, value) {
+        if (!this.#writingGesture && !this.#batchZoom && (name === 'zoom' || name === 'scale-factor')) this.#cancelGesture()
         switch (name) {
+            case 'fit-viewport': {
+                const [x, y, width, height] = value?.split(' ').map(Number) ?? [0, 0, 1, 1]
+                this.#fitViewport = { x, y, width, height }
+                if (this.#zoom === 'fit-page') this.#render()
+                break
+            }
             case 'zoom':
                 this.#zoom = value !== 'fit-width' && value !== 'fit-page'
                     ? (value === 'original-size' ? 1 : parseFloat(value)) : value
-                this.#render()
+                if (!this.#batchZoom) this.#render()
                 break
             case 'scale-factor':
                 this.#scaleFactor = parseFloat(value) / 100
-                this.#render()
+                if (!this.#batchZoom) this.#render()
                 break
             case 'zoom-preview':
                 if (value === null) this.#render()
@@ -604,6 +877,7 @@ export class FixedLayout extends HTMLElement {
             iframe.addEventListener('load', () => {
                 const doc = iframe.contentDocument
                 iframe.dataset.sectionIndex = index
+                if (onZoom) { this.#attachPDFZoom(doc); this.#attachPDFZoom(this) }
                 this.dispatchEvent(new CustomEvent('load', { detail: { doc, index } }))
                 const { width, height } = getViewport(doc, this.defaultViewport)
                 const frame = {
@@ -627,6 +901,17 @@ export class FixedLayout extends HTMLElement {
         })
     }
     #render(side = this.#side, pageTurn = false) {
+        const anchor = pageTurn ? null : this.#captureVisualAnchor()
+        const index = this.index
+        const result = this.#renderLayout(side, pageTurn)
+        if (this.#zoom === 'fit-page' && this.#scaleFactor === 1 && this.hasAttribute('fit-viewport')) {
+            this.#clampedZoomAnchor = null
+            if (this.#scrollMode) this.#scrollCurrentIndex = index
+            this.scrollToPageRect(index, { x: 0, y: 0, width: 1, height: 1 }, this.#fitViewport)
+        } else this.#restoreVisualAnchor(anchor)
+        return result
+    }
+    #renderLayout(side, pageTurn) {
         if (this.#scrollMode) {
             this.#renderScrollMode()
             return []
@@ -635,7 +920,9 @@ export class FixedLayout extends HTMLElement {
         const left = this.#left ?? {}
         const right = this.#center ?? this.#right ?? {}
         const target = side === 'left' ? left : right
-        const { width, height } = this.getBoundingClientRect()
+        const host = this.getBoundingClientRect()
+        const width = this.#zoom === 'fit-page' ? host.width * this.#fitViewport.width : host.width
+        const height = this.#zoom === 'fit-page' ? host.height * this.#fitViewport.height : host.height
         // for unfolded devices with slightly taller height than width also use landscape layout
         const portrait = this.spread !== 'both' && this.spread !== 'portrait'
             && height > width * 1.2
@@ -680,6 +967,10 @@ export class FixedLayout extends HTMLElement {
             // pushes it out of view and blanks the page (#4857). Keep those in
             // normal block flow at every zoom.
             const centerInBox = zoomedOut && onZoom
+            const fitting = this.#zoom === 'fit-page' && this.#scaleFactor === 1 && this.hasAttribute('fit-viewport')
+            const pageHeight = (height ?? blankHeight) * scale
+            const topSpace = Math.max(0, host.height * (this.#fitViewport.y + this.#fitViewport.height / 2) - pageHeight / 2)
+            const bottomSpace = Math.max(0, host.height - topSpace - pageHeight)
             if (!onZoom) Object.assign(iframe.style, {
                 width: `${width * iframeScale}px`,
                 height: `${height * iframeScale}px`,
@@ -692,7 +983,7 @@ export class FixedLayout extends HTMLElement {
                 height: `${(height ?? blankHeight) * scale}px`,
                 flexShrink: '0',
                 display: centerInBox ? 'flex' : 'block',
-                marginBlock: centerInBox ? undefined : 'auto',
+                marginBlock: fitting ? `${topSpace}px ${bottomSpace}px` : centerInBox ? undefined : 'auto',
                 alignItems: centerInBox ? 'center' : undefined,
                 justifyContent: centerInBox ? 'center' : undefined,
                 ...styles,
@@ -943,7 +1234,7 @@ export class FixedLayout extends HTMLElement {
     #scheduleScrollPages() {
         // While pinching, loading/evicting pages would resize placeholders and
         // drift the scroll position, breaking the preview-to-commit alignment.
-        if (this.#pinching) return
+        if (this.#pinching || this.#zoomGesture || this.#panning) return
         const currentIndex = this.#getScrollIndex()
         const { load, evict } = planScrollModePages({
             pages: this.#scrollPages,
@@ -986,7 +1277,8 @@ export class FixedLayout extends HTMLElement {
         this.scrollBy({ left: delta.left, behavior: 'auto' })
     }
     #setScrollIframeInteraction(enabled) {
-        const value = enabled || this.#selectionPages.length ? 'auto' : ''
+        const value = enabled || this.#panning || this.#zoomGesture || this.hasAttribute('zoom-preview')
+            || this.#selectionPages.length ? 'auto' : ''
         for (const page of this.#scrollPages) {
             if (page.frame?.iframe) {
                 page.frame.iframe.style.pointerEvents = value
@@ -1077,6 +1369,7 @@ export class FixedLayout extends HTMLElement {
             iframe.addEventListener('load', () => {
                 const doc = iframe.contentDocument
                 iframe.dataset.sectionIndex = pageData.index
+                if (onZoom) { this.#attachPDFZoom(doc); this.#attachPDFZoom(this) }
                 this.dispatchEvent(new CustomEvent('load', { detail: { doc, index: pageData.index } }))
                 const { width, height } = getViewport(doc, this.defaultViewport)
                 const frame = {
@@ -1230,7 +1523,7 @@ export class FixedLayout extends HTMLElement {
         const base = typeof this.#zoom === 'number' && Number.isFinite(this.#zoom)
             ? this.#zoom
             : this.#zoom === 'fit-page'
-                ? Math.min(host.width / width, host.height / height)
+                ? Math.min(host.width * this.#fitViewport.width / width, host.height * this.#fitViewport.height / height)
                 : this.#zoom === 'fit-width'
                     ? host.width / width
                     : this.#scrollHorizontal ? host.height / height : host.width / width
@@ -1242,6 +1535,17 @@ export class FixedLayout extends HTMLElement {
         // Scale the inter-page gap with the zoom so the committed layout matches
         // the pinch preview (which scales the whole container, gaps included).
         this.style.setProperty('--scroll-zoom', String(this.#scaleFactor))
+        const fitting = this.#zoom === 'fit-page' && this.#scaleFactor === 1 && this.hasAttribute('fit-viewport')
+        const first = this.#scrollPages[0], last = this.#scrollPages.at(-1)
+        const center = hostHeight * (this.#fitViewport.y + this.#fitViewport.height / 2)
+        const gap = parseFloat(this.style.getPropertyValue('--scroll-page-gap')) || 4
+        const firstHeight = first ? first.vpHeight * this.#scrollPageScale(first.vpWidth, first.vpHeight) : 0
+        const lastHeight = last ? last.vpHeight * this.#scrollPageScale(last.vpWidth, last.vpHeight) : 0
+        Object.assign(this.#scrollContainer.style, {
+            paddingTop: fitting ? `${Math.max(0, center - firstHeight / 2 - gap)}px` : '',
+            paddingBottom: fitting ? `${Math.max(0, hostHeight - center - lastHeight / 2 - gap)}px` : '',
+            boxSizing: 'border-box',
+        })
         // A pinch commit restores the viewport-centre anchor (both axes) so the
         // zoom lands exactly where the live preview showed it; every other
         // re-render keeps the reader's vertical position via the top anchor.
@@ -1303,6 +1607,8 @@ export class FixedLayout extends HTMLElement {
     }
     #getScrollIndex() {
         if (!this.#scrollPages.length) return -1
+        const retained = this.#retainedZoomAnchor()
+        if (retained && Number.isInteger(retained.index)) return retained.index
         const hostRect = this.getBoundingClientRect()
         const mid = this.#scrollHorizontal
             ? hostRect.left + hostRect.width / 2
@@ -1529,6 +1835,7 @@ export class FixedLayout extends HTMLElement {
         }
     }
     async goToSpread(index, side, reason) {
+        this.#cancelGesture()
         if (index < 0 || index > this.#spreads.length - 1) return
         if (index === this.#index) {
             if (side) this.#side = side
@@ -1732,7 +2039,9 @@ export class FixedLayout extends HTMLElement {
         // TODO
     }
     async goTo(target) {
+        this.#cancelGesture()
         const resolved = await target
+        this.#clampedZoomAnchor = null
         if (!resolved || !this.book.sections[resolved.index]) return
         if (this.#scrollMode) {
             const page = this.#scrollPages[resolved.index]
@@ -1886,7 +2195,23 @@ export class FixedLayout extends HTMLElement {
                 }
             })
     }
+    setZoom(mode, level, preview = false) {
+        this.#cancelGesture()
+        this.setAttribute('zoom-preview', '')
+        this.#batchZoom = true
+        try {
+            this.setAttribute('zoom', mode)
+            this.setAttribute('scale-factor', level)
+        } finally { this.#batchZoom = false }
+        this.#render()
+        if (!preview) this.removeAttribute('zoom-preview')
+    }
     pinchZoom(ratio) {
+        if (this.#captureVisualAnchor()) {
+            const start = this.#zoomGesture?.start ?? this.scale * 100
+            this.#previewGesture(start * ratio, null)
+            return
+        }
         // Scroll mode: scale the whole scroll container so the zoom tracks the
         // fingers live, anchored at the viewport centre. Suppress paging and
         // snapshot the centre anchor on the first move so the layout stays still
@@ -1918,7 +2243,12 @@ export class FixedLayout extends HTMLElement {
             frame.element.style.transformOrigin = 'center'
         }
     }
-    pinchEnd() {
+    pinchEnd(cancel = false) {
+        if (this.#zoomGesture) {
+            if (cancel) { this.#cancelGesture(); return Math.round(this.scale * 100) }
+            this.#finishGesture()
+            return Math.round(this.scale * 100)
+        }
         if (this.#scrollMode) {
             // Snapshot the centre page's on-screen rect from the still-scaled
             // preview, then drop the transform and resume paging. The committed
@@ -1991,6 +2321,12 @@ export class FixedLayout extends HTMLElement {
     }
     destroy() {
         this.#destroyed = true
+        if (this.#hostZoomBlur) this.ownerDocument.defaultView.removeEventListener('blur', this.#hostZoomBlur)
+        this.#hostZoomBlur = null
+        clearTimeout(this.#zoomTimer)
+        cancelAnimationFrame(this.#zoomFrame)
+        this.#zoomGesture = null
+        this.#zoomPoint = null
         if (this.#resizeFrame !== null) cancelAnimationFrame(this.#resizeFrame)
         clearTimeout(this.#resizeTimer)
         clearTimeout(this.#paginatedLocationTimer)
