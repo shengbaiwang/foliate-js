@@ -1,3 +1,5 @@
+import { compareReaderLocators, getChapterIndex, locatorForCFI, publishChapterIndex, retainChapterIndex } from './chapter-index.js'
+import { NavigationController } from './navigation-controller.js'
 import * as CFI from './epubcfi.js'
 import { TOCProgress, SectionProgress, PageProgress } from './progress.js'
 import { Overlayer } from './overlayer.js'
@@ -206,32 +208,31 @@ class CursorAutohider {
 class History extends EventTarget {
     #arr = []
     #index = -1
-    pushState(x) {
+    pushState(x, nodeId) {
         const last = this.#arr[this.#index]
-        if (last === x || last?.fraction && last.fraction === x.fraction) return
-        this.#arr[++this.#index] = x
+        if (last && last.nodeId === nodeId && (last.target === x
+            || (typeof last.target?.fraction === 'number' && last.target.fraction === x?.fraction))) return
+        this.#arr[++this.#index] = { target: x, nodeId }
         this.#arr.length = this.#index + 1
         this.dispatchEvent(new Event('index-change'))
     }
     replaceState(x) {
         const index = this.#index
-        this.#arr[index] = x
+        if (index < 0) this.pushState(x)
+        else this.#arr[index] = { target: x }
     }
-    back() {
-        const index = this.#index
-        if (index <= 0) return
-        const detail = { state: this.#arr[index - 1] }
-        this.#index = index - 1
-        this.dispatchEvent(new CustomEvent('popstate', { detail }))
-        this.dispatchEvent(new Event('index-change'))
-    }
-    forward() {
-        const index = this.#index
-        if (index >= this.#arr.length - 1) return
-        const detail = { state: this.#arr[index + 1] }
-        this.#index = index + 1
-        this.dispatchEvent(new CustomEvent('popstate', { detail }))
-        this.dispatchEvent(new Event('index-change'))
+    move
+    back() { return this.#step(-1) }
+    forward() { return this.#step(1) }
+    #step(delta) {
+        const index = this.#index + delta
+        if (index < 0 || index >= this.#arr.length) return
+        const { target, nodeId } = this.#arr[index]
+        return this.move?.(target, () => {
+            this.#index = index
+            this.dispatchEvent(new CustomEvent('popstate', { detail: { state: target } }))
+            this.dispatchEvent(new Event('index-change'))
+        }, nodeId)
     }
     get canGoBack() {
         return this.#index > 0
@@ -263,7 +264,14 @@ export class View extends HTMLElement {
     #root = this.attachShadow({ mode: 'open' })
     #pdfSelection = null
     #sectionProgress
-    #tocProgress
+    #navigator = new NavigationController()
+    #observed
+    #moving = false
+    #intent
+    #observedSequence = 0
+    #navigationSession = { pending: 0 }
+    #releaseChapterIndex
+    #openRequest
     #pageProgress
     #cfiProgress
     #searchResults = new Map()
@@ -275,17 +283,30 @@ export class View extends HTMLElement {
     history = new History()
     constructor() {
         super()
-        this.history.addEventListener('popstate', ({ detail }) => {
-            this.#pdfSelection?.clear({ native: true })
-            const resolved = this.resolveNavigation(detail.state)
-            this.renderer.goTo(resolved)
-        })
+        this.history.move = (target, commitHistory, nodeId) => this.navigate(target, {
+            commitHistory, nodeId: getChapterIndex(this.book).node(nodeId)?.id })
+        for (const type of ['wheel', 'touchmove'])
+            this.addEventListener(type, this.#onReadingGesture, { passive: true })
+    }
+    #onReadingGesture = event => {
+        if (event.ctrlKey || event.touches?.length > 1) return
+        this.#interruptAbsoluteNavigation()
+    }
+    #interruptAbsoluteNavigation() {
+        this.#intent = null
+        this.#navigator.cancelAbsolute()
+        if (this.#moving) this.#moving.interrupted = true
     }
     async open(book) {
+        if (this.#releaseChapterIndex) this.close()
+        const request = this.#openRequest = {}
+        const opening = () => request === this.#openRequest
         if (typeof book === 'string'
         || typeof book.arrayBuffer === 'function'
         || book.isDirectory) book = await makeBook(book)
+        if (!opening()) return
         this.book = book
+        this.#releaseChapterIndex = retainChapterIndex(book)
         this.language = languageInfo(book.metadata?.language)
 
         if (book.splitTOCHref && book.getTOCFragment) {
@@ -293,34 +314,39 @@ export class View extends HTMLElement {
             this.#sectionProgress = new SectionProgress(book.sections, 1500, 1600)
             const splitHref = book.splitTOCHref.bind(book)
             const getFragment = book.getTOCFragment.bind(book)
-            this.#tocProgress = new TOCProgress()
-            await this.#tocProgress.init({
-                toc: book.toc ?? [], ids, splitHref, getFragment })
+            getChapterIndex(book)
             this.#pageProgress = new TOCProgress()
             await this.#pageProgress.init({
                 toc: book.pageList ?? [], ids, splitHref, getFragment })
         }
+        if (!opening()) return
         this.#cfiProgress = new PageProgress(book, this.resolveNavigation.bind(this))
 
         this.isFixedLayout = this.book.rendition?.layout === 'pre-paginated'
         if (this.isFixedLayout) {
             await import('./fixed-layout.js')
+            if (!opening()) return
             this.renderer = document.createElement('foliate-fxl')
             if (book.getPDFAnnotationRects) {
                 const { PDFCrossPageSelection } = await import('./pdf-cross-page-selection.js')
+                if (!opening()) return
                 this.#pdfSelection = new PDFCrossPageSelection(this)
             }
         } else {
             await import('./paginator.js')
+            if (!opening()) return
             this.renderer = document.createElement('foliate-paginator')
         }
         this.renderer.setAttribute('exportparts', 'head,foot,filter,container')
-        this.renderer.addEventListener('load', e => this.#onLoad(e.detail))
-        this.renderer.addEventListener('relocate', e => this.#onRelocate(e.detail))
-        this.renderer.addEventListener('create-overlayer', e =>
-            e.detail.attach(this.#createOverlayer(e.detail)))
-        this.renderer.open(book)
-        this.#root.append(this.renderer)
+        const renderer = this.renderer
+        const current = () => this.book === book && this.renderer === renderer
+        renderer.addEventListener('load', e => { if (current()) this.#onLoad(e.detail) })
+        renderer.addEventListener('relocate', e => { if (current()) this.#onRelocate(e.detail) })
+        renderer.addEventListener('create-overlayer', e => {
+            if (current()) e.detail.attach(this.#createOverlayer(e.detail))
+        })
+        renderer.open(book)
+        this.#root.append(renderer)
 
         if (book.sections.some(section => section.mediaOverlay)) {
             const activeClass = book.media.activeClass
@@ -329,11 +355,11 @@ export class View extends HTMLElement {
             let lastActive
             this.mediaOverlay.addEventListener('highlight', e => {
                 this.#pdfSelection?.clear({ native: true })
-                const resolved = this.resolveNavigation(e.detail.text)
-                this.renderer.goTo(resolved)
-                    .then(() => {
+                this.navigate(e.detail.text, { history: false })
+                    .then(({ status, resolved }) => {
+                        if (status !== 'arrived') return
                         const { doc } = this.renderer.getContents()
-                            .find(x => x.index = resolved.index)
+                            .find(x => x.index === resolved.index)
                         const el = resolved.anchor(doc)
                         el.classList.add(activeClass)
                         if (playbackActiveClass) el.ownerDocument
@@ -352,12 +378,22 @@ export class View extends HTMLElement {
         }
     }
     close() {
+        this.#openRequest = null
+        this.#navigator.cancel()
+        this.#navigator = new NavigationController()
+        this.#navigationSession = { pending: 0 }
+        this.#moving = false
+        this.#observed = null
+        this.#intent = null
         this.#pdfSelection?.destroy()
         this.#pdfSelection = null
-        this.renderer?.destroy()
-        this.renderer?.remove()
+        this.#releaseChapterIndex?.()
+        this.#releaseChapterIndex = null
+        const renderer = this.renderer
+        this.renderer = null
+        renderer?.destroy()
+        renderer?.remove()
         this.#sectionProgress = null
-        this.#tocProgress = null
         this.#pageProgress = null
         this.#cfiProgress = null
         this.#searchResults = new Map()
@@ -376,53 +412,58 @@ export class View extends HTMLElement {
     // renderer, text selection, CFI and history alive.
     async updateTOC(toc, signal) {
         const book = this.book
-        const renderer = this.renderer
-        if (!book?.splitTOCHref || !book.getTOCFragment) return
-        const progress = new TOCProgress()
-        await progress.init({ toc, ids: book.sections.map(s => s.id),
-            splitHref: book.splitTOCHref.bind(book),
-            getFragment: book.getTOCFragment.bind(book) })
-        if (signal?.aborted || this.book !== book || this.renderer !== renderer
-            || !this.#sectionProgress) return
-        book.toc = toc
-        this.#tocProgress = progress
-        // The visible range may belong to a different section than the
-        // paginator's primary view when several sections share a viewport.
-        const doc = this.lastLocation?.range?.startContainer.getRootNode()
-        const index = renderer.getContents().find(content => content.doc === doc)?.index
-            ?? renderer.primaryIndex ?? renderer.index
-        if (this.lastLocation && index != null) {
-            this.lastLocation = { ...this.lastLocation,
-                tocItem: progress.getProgress(index, this.lastLocation.range) }
-            this.#emit('relocate', this.lastLocation)
-        }
+        if (!book || signal?.aborted || !this.#sectionProgress) return
+        publishChapterIndex(book, toc, this.renderer.getContents())
+        if (this.#observed && !this.#moving) this.#publishLocation(this.#observed, 'outline')
     }
     async init({ lastLocation, showTextStart }) {
-        const resolved = lastLocation ? this.resolveNavigation(lastLocation) : null
-        if (resolved) {
-            await this.renderer.goTo(resolved)
-            this.history.pushState(lastLocation)
-        }
-        else if (showTextStart) await this.goToTextStart()
-        else {
-            this.history.pushState(0)
-            await this.next()
-        }
+        if (lastLocation && (await this.navigate(lastLocation)).status === 'arrived') return
+        if (showTextStart) await this.goToTextStart()
+        else await this.next()
     }
     #emit(name, detail, cancelable) {
         return this.dispatchEvent(new CustomEvent(name, { detail, cancelable }))
     }
     #onRelocate({ reason, range, index, fraction, size }) {
-        const progress = this.#sectionProgress?.getProgress(index, fraction, size) ?? {}
-        const tocItem = this.#tocProgress?.getProgress(index, range)
+        if (!this.book?.sections[index] || !this.#sectionProgress) return
+        const progress = this.#sectionProgress.getProgress(index, fraction, size)
         const pageItem = this.#pageProgress?.getProgress(index, range)
         const cfi = this.getCFI(index, range)
-        this.lastLocation = { ...progress, tocItem, pageItem, cfi, range }
-        if (reason === 'snap' || reason === 'page' || reason === 'scroll')
+        this.#observed = { ...progress, index, pageItem, cfi, range, reason }
+        this.#observedSequence++
+        if (!this.#moving || (this.#moving.interrupted
+            && (reason === 'scroll' || reason === 'container-scroll')))
+            this.#publishLocation(this.#observed)
+    }
+    #publishLocation(location, reason = location.reason) {
+        const { index, cfi } = location
+        const chapters = getChapterIndex(this.book)
+        const locator = locatorForCFI(this.book, cfi, index)
+        if (reason === 'page' || reason === 'snap') this.#intent = null
+        if (this.#intent && !this.#visible(this.#intent.resolved, location)) this.#intent = null
+        const target = this.#intent
+        const matched = target?.nodeId ? chapters.node(target.nodeId) : null
+        const position = chapters.locate(target?.locator ?? locator)
+        const chapter = matched ?? position.node
+        this.lastLocation = { ...location, reason, locator,
+            chapterId: chapter?.id, tocItem: chapter?.item ?? null,
+            chapterQuality: matched ? chapters.range(matched.id)?.quality ?? 'resource' : position.quality }
+        if (!this.#intent && ['snap', 'page', 'scroll', 'container-scroll'].includes(reason))
             this.history.replaceState(cfi)
         this.#emit('relocate', this.lastLocation)
     }
     #onLoad({ doc, index }) {
+        const book = this.book, renderer = this.renderer
+        const prepare = () => {
+            if (this.book !== book || this.renderer !== renderer || !this.#sectionProgress) return
+            const changed = getChapterIndex(book).prepareResource(index, doc)
+            if (changed && !this.#moving && this.#observed?.index === index)
+                this.#publishLocation(this.#observed, 'layout')
+        }
+        getChapterIndex(book).prepareResource(index, doc)
+        if (book.getPDFAnnotationRects) doc.addEventListener('pdf-text-ready', prepare)
+        for (const type of ['wheel', 'touchmove'])
+            doc.addEventListener(type, this.#onReadingGesture, { passive: true })
         this.#pdfSelection?.attach(doc, index)
         // set language and dir if not already set
         doc.documentElement.lang ||= this.language.canonical ?? ''
@@ -436,6 +477,7 @@ export class View extends HTMLElement {
     }
     #handleLinks(doc, index) {
         const { book } = this
+        const renderer = this.renderer
         const section = book.sections[index]
         doc.addEventListener('click', e => {
             const a = e.target.closest('a[href]')
@@ -449,7 +491,9 @@ export class View extends HTMLElement {
                     .catch(e => console.error(e))
             else {
                 let internalHref = href
-                if (!book.resolveHref(href)) {
+                // Reflowable adapters resolve this synchronously. A PDF destination
+                // is asynchronous and is resolved once by the navigation request.
+                if (!book.getPDFAnnotationRects && !book.resolveHref(href)) {
                     const hashIndex = href_.indexOf('#')
                     if (hashIndex >= 0) {
                         const hash = href_.slice(hashIndex)
@@ -457,7 +501,7 @@ export class View extends HTMLElement {
                     }
                 }
                 Promise.resolve(this.#emit('link', { a, href: internalHref }, true))
-                    .then(x => x ? this.goTo(internalHref) : null)
+                    .then(x => x && renderer === this.renderer ? this.goTo(internalHref) : null)
                     .catch(e => console.error(e))
             }
         })
@@ -519,7 +563,8 @@ export class View extends HTMLElement {
                 }
             }
         }
-        const label = this.#tocProgress?.getProgress(firstIndex)?.label ?? ''
+        const label = getChapterIndex(this.book)
+            .locate(locatorForCFI(this.book, targets[0], firstIndex)).node?.item.label ?? ''
         return { index: firstIndex, label }
     }
     deleteAnnotation(annotation) {
@@ -591,7 +636,14 @@ export class View extends HTMLElement {
     resolveNavigation(target) {
         try {
             if (typeof target === 'number') return { index: target }
-            if (typeof target.fraction === 'number') {
+            if (typeof target?.resourceIndex === 'number') {
+                const reference = locatorForCFI(this.book, undefined, target.resourceIndex)
+                if (!reference || compareReaderLocators(reference, target) == null) return
+                if (!target.cfi) return { index: target.resourceIndex }
+                const resolved = this.resolveCFI(target.cfi)
+                return resolved?.index === target.resourceIndex ? resolved : undefined
+            }
+            if (typeof target?.fraction === 'number') {
                 const [index, anchor] = this.#sectionProgress.getSection(target.fraction)
                 return { index, anchor }
             }
@@ -602,34 +654,97 @@ export class View extends HTMLElement {
             console.error(`Could not resolve target ${target}`)
         }
     }
-    async goTo(target) {
-        this.#pdfSelection?.clear({ native: true })
-        const resolved = this.resolveNavigation(target)
-        try {
-            await this.renderer.goTo(resolved)
-            this.history.pushState(target)
-            return resolved
-        } catch(e) {
-            console.error(e)
-            console.error(`Could not go to ${target}`)
+    #visible(resolved, location) {
+        if (!location) return false
+        const { index, anchor } = resolved
+        const doc = this.renderer.getContents?.().find(content => content.index === index)?.doc
+        const iframe = doc?.defaultView?.frameElement
+        if (!iframe) return !anchor && location.index === index
+        const frame = iframe.getBoundingClientRect()
+        const host = this.renderer.getBoundingClientRect()
+        if (frame.bottom <= host.top || frame.top >= host.bottom
+            || frame.right <= host.left || frame.left >= host.right) return false
+        let target
+        try { target = typeof anchor === 'function' ? anchor(doc) : anchor }
+        catch { return false }
+        if (anchor && target == null) return false
+        if (!target || typeof target === 'number') {
+            // Foliate settles progress fractions to the closest column/spread.
+            // The renderer confirms that snap; the resource must intersect
+            // the viewport but the raw unsnapped fraction need not be visible.
+            return true
+        }
+        const scale = frame.width / (doc.documentElement?.clientWidth || frame.width) || 1
+        const first = Array.from(target.getClientRects?.() ?? [])
+            .find(rect => rect.width > 0 && rect.height > 0)
+        const rect = first ?? target.getBoundingClientRect()
+        const x = frame.left + scale * rect.left, y = frame.top + scale * rect.top
+        return x >= host.left - 1 && x <= host.right + 1 && y >= host.top - 1 && y <= host.bottom + 1
+    }
+    async navigate(target, options) {
+        const session = this.#navigationSession
+        if (session.pending++ === 0) this.#emit('navigate-start')
+        try { return await this.#navigate(target, options) }
+        finally {
+            if (--session.pending === 0 && session === this.#navigationSession)
+                this.#emit('navigate-end')
         }
     }
-    async goToFraction(frac) {
-        this.#pdfSelection?.clear({ native: true })
-        const [index, anchor] = this.#sectionProgress.getSection(frac)
-        await this.renderer.goTo({ index, anchor })
-        this.history.pushState({ fraction: frac })
+    cancelNavigation() { this.#navigator.cancel() }
+    async #navigate(target, { signal, nodeId, history = true, commitHistory, select = false } = {}) {
+        const book = this.book, renderer = this.renderer
+        let resolved
+        const status = await this.#navigator.run(async current => {
+            const valid = () => current() && book === this.book && renderer === this.renderer
+                && !!this.#sectionProgress
+            if (!valid()) return false
+            const chapters = getChapterIndex(book)
+            const node = nodeId ? chapters.node(nodeId) : chapters.byHref(target)
+            if (nodeId && !node) return false
+            const destination = node?.item.href ?? target
+            resolved = await this.resolveNavigation(destination)
+            if (!valid() || !book.sections[resolved?.index]) return false
+            if (!this.isFixedLayout && typeof destination === 'string'
+                && !CFI.isCFI.test(destination) && resolved.anchor
+                && book.splitTOCHref?.(destination)?.[1]
+                && this.#observed
+                && !chapters.range(node?.id)?.start) {
+                const doc = renderer.getContents().find(content => content.index === resolved.index)?.doc
+                    ?? await book.sections[resolved.index].createDocument?.()
+                if (!valid() || (doc && resolved.anchor(doc) == null)) return false
+            }
+            this.#intent = null
+            this.#pdfSelection?.clear({ native: true })
+            const move = this.#moving = {}
+            const sequence = this.#observedSequence
+            try {
+                const completed = await renderer.goTo({ ...resolved, select, current: valid })
+                if (!valid()) return false
+                const observed = this.#observed
+                if (completed === false || !this.#visible(resolved, observed)) {
+                    if (this.#observedSequence !== sequence) this.#publishLocation(observed, 'layout')
+                    return false
+                }
+                const anchor = chapters.range(node?.id)?.start
+                    ?? (typeof target === 'string' && CFI.isCFI.test(target)
+                        ? locatorForCFI(book, target, resolved.index) : null)
+                this.#intent = node || anchor ? { nodeId: node?.id, locator: anchor, resolved } : null
+                if (commitHistory) commitHistory()
+                else if (history) this.history.pushState(target, node?.id)
+                this.#publishLocation(observed, 'navigation')
+                return true
+            } finally { if (this.#moving === move) this.#moving = false }
+        }, { signal })
+        return { status, resolved: status === 'arrived' ? resolved : undefined }
+    }
+    async goTo(target) {
+        return (await this.navigate(target)).resolved
+    }
+    async goToFraction(fraction) {
+        return this.goTo({ fraction })
     }
     async select(target) {
-        this.#pdfSelection?.clear({ native: true })
-        try {
-            const obj = await this.resolveNavigation(target)
-            await this.renderer.goTo({ ...obj, select: true })
-            this.history.pushState(target)
-        } catch(e) {
-            console.error(e)
-            console.error(`Could not go to ${target}`)
-        }
+        return this.navigate(target, { select: true })
     }
     deselect() {
         this.#pdfSelection?.clear({ native: true })
@@ -646,7 +761,9 @@ export class View extends HTMLElement {
             .map(x => x + Number.EPSILON)
     }
     getProgressOf(index, range) {
-        const tocItem = this.#tocProgress?.getProgress(index, range)
+        const cfi = this.book.sections[index] ? this.getCFI(index, range) : undefined
+        const tocItem = getChapterIndex(this.book)
+            .locate(locatorForCFI(this.book, cfi, index)).node?.item
         const pageItem = this.#pageProgress?.getProgress(index, range)
         return { tocItem, pageItem }
     }
@@ -656,29 +773,36 @@ export class View extends HTMLElement {
         return this.#sectionProgress?.getProgress(progress.index, progress.fraction)
     }
     async getTOCItemOf(target) {
-        try {
-            const { index, anchor } = await this.resolveNavigation(target)
-            const doc = await this.book.sections[index].createDocument()
-            const frag = anchor(doc)
-            const isRange = frag instanceof Range
-            const range = isRange ? frag : doc.createRange()
-            if (!isRange) range.selectNodeContents(frag)
-            return this.#tocProgress?.getProgress(index, range)
-        } catch(e) {
-            console.error(e)
-            console.error(`Could not get ${target}`)
-        }
+        const resolved = await this.resolveNavigation(target)
+        if (!resolved) return
+        const chapters = getChapterIndex(this.book)
+        return chapters.byHref(target)?.item
+            ?? chapters.locate(locatorForCFI(this.book, target, resolved.index)).node?.item
     }
-    async prev(distance) {
-        this.#pdfSelection?.clear({ native: true })
-        await this.renderer.prev(distance)
+    async #turn(direction, distance) {
+        const renderer = this.renderer
+        return this.#navigator.run(async current => {
+            if (!current() || renderer !== this.renderer || !this.#sectionProgress) return false
+            this.#intent = null
+            this.#pdfSelection?.clear({ native: true })
+            const sequence = this.#observedSequence
+            await renderer[direction](distance)
+            if (!current() || renderer !== this.renderer || sequence === this.#observedSequence)
+                return false
+            this.history.replaceState(this.#observed.cfi)
+            return true
+        }, { relative: true })
     }
-    async next(distance) {
-        this.#pdfSelection?.clear({ native: true })
-        await this.renderer.next(distance)
+    async prev(distance) { await this.#turn('prev', distance) }
+    async next(distance) { await this.#turn('next', distance) }
+    async stepResource(direction) {
+        const method = direction === 1 ? 'nextSection' : 'prevSection'
+        if (this.renderer?.[method]) await this.#turn(method)
+        else await this.#turn(direction === 1 ? 'next' : 'prev')
     }
     async pan(dx, dy) {
-        await this.renderer.pan(dx, dy)
+        this.#interruptAbsoluteNavigation()
+        await this.renderer?.pan(dx, dy)
     }
     isOverflowX() {
         return this.renderer.isOverflowX
@@ -742,6 +866,7 @@ export class View extends HTMLElement {
 
         const list = []
         const seen = new Set()
+        const seenByResource = new Map()
         this.#searchResults.set(index, list)
         // Add one annotation per unique CFI (a nearby-words match carries several
         // via `cfis`); dedupe so overlapping CFIs don't collide in #searchResults.
@@ -757,14 +882,18 @@ export class View extends HTMLElement {
 
         for await (const result of iter) {
             if (result.subitems){
-                const sectionList = []
-                const sectionSeen = new Set()
-                for (const item of result.subitems)
+                for (const item of result.subitems) {
+                    const resource = locatorForCFI(this.book, item.cfi)?.resourceIndex ?? result.index
+                    const sectionList = this.#searchResults.get(resource) ?? []
+                    let sectionSeen = seenByResource.get(resource)
+                    if (!sectionSeen) seenByResource.set(resource, sectionSeen = new Set())
                     addHighlights(item.cfis ?? [item.cfi], sectionList, sectionSeen)
-                this.#searchResults.set(result.index, sectionList)
+                    this.#searchResults.set(resource, sectionList)
+                }
                 yield {
                     index: result.index,
-                    label: this.#tocProgress?.getProgress(result.index)?.label ?? '',
+                    label: getChapterIndex(this.book).locate(locatorForCFI(
+                        this.book, result.subitems[0]?.cfi, result.index)).node?.item.label ?? '',
                     subitems: result.subitems,
                 }
             }

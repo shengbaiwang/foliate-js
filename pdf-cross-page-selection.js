@@ -281,9 +281,11 @@ export class PDFCrossPageSelection {
         const renderer = this.#view.renderer
         if (renderer.scrolled && drag.point) {
             const rect = renderer.getBoundingClientRect()
-            const speed = (p, start, end) => p < start + 40
-                ? -Math.min(1, (start + 40 - p) / 40)
-                : p > end - 40 ? Math.min(1, (p - end + 40) / 40) : 0
+            const speed = (p, start, end) => {
+                const depth = Math.max(-1, Math.min(1,
+                    p < start + 40 ? (p - start - 40) / 40 : p > end - 40 ? (p - end + 40) / 40 : 0))
+                return depth * Math.abs(depth)
+            }
             const step = Math.min(32, time - (drag.time ?? time)) * 0.9
             const travel = (p, origin, velocity) => Math.sign(p - origin) === Math.sign(velocity)
                 && Math.abs(p - origin) > 8 ? velocity : 0
@@ -467,9 +469,9 @@ export class PDFCrossPageSelection {
             const preview = new Overlayer(doc)
             preview.element.dataset.pdfSelectionPreview = ''
             preview.add('selection', range, Overlayer.highlight, {
-                color: 'Highlight', padding: 0, radius: 0, radiusPadding: 0,
+                color: 'var(--pdf-selection-color, rgba(64, 111, 168, 0.23))',
+                padding: 0, radius: 0, radiusPadding: 0,
             })
-            preview.element.style.opacity = '.3'
             doc.body.append(preview.element)
             this.#previews.push(preview.element)
         }

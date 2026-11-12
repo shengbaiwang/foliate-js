@@ -9,6 +9,7 @@ const crossPageDocuments = new WeakSet()
 export const setCrossPageSelection = (doc, active) => {
     if (active) crossPageDocuments.add(doc)
     else crossPageDocuments.delete(doc)
+    doc.documentElement?.toggleAttribute('data-pdf-coordinated-selection', active)
 }
 
 export const getPDFSelectionCaret = (doc, x, y) => {
@@ -51,13 +52,27 @@ export const setupOCRSelection = container => {
     const snapshot = () => Array.from(reading.querySelectorAll('span'))
         .filter(span => span.firstChild?.nodeType === 3 && span.textContent.length
             && !span.hasAttribute('data-pdf-legacy'))
-        .map(span => ({ span, box: span.getBoundingClientRect() }))
+        .map(span => ({
+            span, box: span.getBoundingClientRect(),
+            vertical: win.getComputedStyle(span).writingMode.startsWith('vertical'),
+        }))
     const caret = (items, x, y, cache) => {
         if (!items.length) return null
-        const distance = box => Math.hypot(Math.max(box.top - y, 0, y - box.bottom),
-            Math.max(box.left - x, 0, x - box.right))
-        const item = items.reduce((best, item) =>
-            !best || distance(item.box) < distance(best.box) ? item : best, null)
+        // Keep the endpoint on the line under the pointer in its trailing
+        // whitespace, even when the next line has a much longer text span.
+        let item = null
+        let bestAcross = Infinity, bestAlong = Infinity
+        for (const candidate of items) {
+            const { box, vertical } = candidate
+            const dx = Math.max(box.left - x, 0, x - box.right)
+            const dy = Math.max(box.top - y, 0, y - box.bottom)
+            const [across, along] = vertical ? [dx, dy] : [dy, dx]
+            if (across < bestAcross || (across === bestAcross && along < bestAlong)) {
+                item = candidate
+                bestAcross = across
+                bestAlong = along
+            }
+        }
         if (!item || !supported(item.span)) return null
         const node = item.span.firstChild
         if (!node) return null
@@ -65,7 +80,7 @@ export const setupOCRSelection = container => {
         if (!points) {
             points = []
             const range = doc.createRange()
-            const vertical = win.getComputedStyle(item.span).writingMode.startsWith('vertical')
+            const { vertical } = item
             let rtl = win.getComputedStyle(item.span).direction === 'rtl'
             // Grapheme boundaries prevent splitting surrogate pairs or accents.
             for (const { index, segment } of new Intl.Segmenter(undefined,
@@ -102,8 +117,12 @@ export const setupOCRSelection = container => {
     const update = event => {
         if (!drag || crossPageDocuments.has(doc)) return
         const end = caret(drag.items, event.clientX, event.clientY, drag.cache)
-        if (end) doc.getSelection()?.setBaseAndExtent(
-            drag.start.node, drag.start.offset, end.node, end.offset)
+        if (end) {
+            const selection = doc.getSelection()
+            if (selection?.anchorNode === drag.start.node && selection.anchorOffset === drag.start.offset
+                && selection.focusNode === end.node && selection.focusOffset === end.offset) return
+            selection?.setBaseAndExtent(drag.start.node, drag.start.offset, end.node, end.offset)
+        }
     }
     const cancelUpdate = () => {
         if (animation != null) win.cancelAnimationFrame(animation)

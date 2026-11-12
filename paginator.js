@@ -837,12 +837,27 @@ class View {
     get contentPages() {
         return this.#contentPages
     }
+    #cancelLoad
+    loadReady
     async load(src, data, afterLoad, beforeRender) {
         if (typeof src !== 'string') throw new Error(`${src} is not string`)
-        return new Promise(resolve => {
+        return this.loadReady = new Promise(resolve => {
+            const listeners = new AbortController()
+            let pending = true
+            const finish = result => {
+                if (!pending) return
+                pending = false
+                clearTimeout(timer)
+                listeners.abort()
+                this.#cancelLoad = null
+                resolve(result)
+            }
+            const cancel = this.#cancelLoad = () => finish(false)
+            const timer = setTimeout(cancel, 30000)
+            this.#iframe.addEventListener('error', cancel, { once: true, signal: listeners.signal })
             this.#iframe.addEventListener('load', async () => {
                 const doc = this.document
-                if (!doc?.documentElement || !doc.body) return resolve()
+                if (!doc?.documentElement || !doc.body) return finish(false)
                 afterLoad?.(doc)
 
                 this.#iframe.setAttribute('aria-label', doc.title)
@@ -896,7 +911,7 @@ class View {
                 // Awaiting the background image yields control, so the view may
                 // have been torn down or reloaded meanwhile — don't render into
                 // a stale document.
-                if (this.document !== doc) return resolve()
+                if (!pending || this.document !== doc) return finish(false)
                 this.#iframe.style.display = 'none'
 
                 this.#vertical = vertical
@@ -914,8 +929,8 @@ class View {
                 // until the bug is fixed we can at least account for font load
                 this.fontReady = doc.fonts.ready.then(() => this.expand())
 
-                resolve()
-            }, { once: true })
+                finish(true)
+            }, { once: true, signal: listeners.signal })
             if (data) {
                 this.#iframe.srcdoc = data
             } else {
@@ -1372,6 +1387,7 @@ class View {
             this.#overlayer.clearHole()
     }
     destroy() {
+        this.#cancelLoad?.()
         if (this.document?.body) this.#observer.unobserve(this.document.body)
         this.destroyLoupe()
     }
@@ -3498,7 +3514,12 @@ export class Paginator extends HTMLElement {
     async #display(promise) {
         this.#stabilizing = true
         this.#container.style.opacity = '0'
-        const { index, src, data, anchor, onLoad, select } = await promise
+        const { index, src, data, anchor, onLoad, select, current } = await promise
+        if (current && !current()) {
+            this.#container.style.opacity = '1'
+            this.#stabilizing = false
+            return
+        }
         this.#primaryIndex = index
         this.#syncA11y()
         const hasFocus = this.#primaryView?.document?.hasFocus()
@@ -3517,14 +3538,15 @@ export class Paginator extends HTMLElement {
                 onLoad?.({ doc, index })
             }
             const beforeRender = this.#beforeRender.bind(this)
-            await view.load(src, data, afterLoad, beforeRender)
-            if (!view.document?.documentElement || !view.document.body) {
+            const loaded = await view.load(src, data, afterLoad, beforeRender)
+            if (this.#views.get(index) !== view) return current ? false : undefined
+            if (!loaded || !view.document?.documentElement || !view.document.body) {
                 this.#destroyView(index)
                 this.#primaryIndex = this.#sortedViews[0]?.[0] ?? -1
                 this.#container.style.opacity = '1'
                 this.#stabilizing = false
                 this.dispatchEvent(new Event('stabilized'))
-                return
+                return current ? false : undefined
             }
             // Cache direction for future preload boundary checks
             if (view.document) {
@@ -3556,9 +3578,18 @@ export class Paginator extends HTMLElement {
                 }
             }
         }
-        const resolvedAnchor = (typeof anchor === 'function'
-            ? anchor(primaryView.document) : anchor) ?? 0
-        await this.scrollToAnchor(resolvedAnchor, select)
+        if (!primaryView || (current && !current())) {
+            this.#container.style.opacity = '1'
+            this.#stabilizing = false
+            return
+        }
+        const resolvedAnchor = typeof anchor === 'function' ? anchor(primaryView.document) : anchor
+        if (anchor && resolvedAnchor == null && current) {
+            this.#container.style.opacity = '1'
+            this.#stabilizing = false
+            return false
+        }
+        await this.scrollToAnchor(resolvedAnchor ?? 0, select)
         if (hasFocus) this.focusView()
         // Reveal content now that primary section is positioned
         this.#container.style.opacity = '1'
@@ -3610,8 +3641,9 @@ export class Paginator extends HTMLElement {
             // global state (direction, CSS classes, dir attribute, etc.).
             const cachedLayout = this.#lastLayout
             const beforeRender = () => cachedLayout
-            await view.load(src, data, afterLoad, beforeRender)
-            if (!view.document?.documentElement || !view.document.body) {
+            const loaded = await view.load(src, data, afterLoad, beforeRender)
+            if (this.#views.get(index) !== view) return
+            if (!loaded || !view.document?.documentElement || !view.document.body) {
                 this.#destroyView(index)
                 return
             }
@@ -3722,9 +3754,12 @@ export class Paginator extends HTMLElement {
     #canGoToIndex(index) {
         return index >= 0 && index <= this.sections.length - 1
     }
-    async #goTo({ index, anchor, select }) {
+    async #goTo({ index, anchor, select, current }) {
         const section = this.sections[index]
         if (!section) return
+        const preparing = this.#views.get(index)
+        if (preparing?.loadReady) await preparing.loadReady
+        if (current && !current()) return false
         // Check if the target section has a different writing-mode.
         // If direction changes, we must destroy all views and do a full
         // rebuild via #display — mixed-direction views cannot coexist.
@@ -3742,6 +3777,10 @@ export class Paginator extends HTMLElement {
         // detect and clean up stale views if a change actually occurs.
 
         if (this.#views.has(index) && !directionChanged) {
+            const previousIndex = this.#primaryIndex
+            const targetView = this.#views.get(index)
+            const resolvedAnchor = typeof anchor === 'function' ? anchor(targetView.document) : anchor
+            if (anchor && resolvedAnchor == null && current) return false
             // View already loaded — reuse it without
             // clearing/reloading. Just change primary and scroll.
             this.#stabilizing = true
@@ -3763,8 +3802,6 @@ export class Paginator extends HTMLElement {
                 }
             }
             const primaryView = this.#primaryView
-            const resolvedAnchor = (typeof anchor === 'function'
-                ? anchor(primaryView.document) : anchor) ?? 0
             // Pre-load the previous section so the user can move backward right
             // away: a short paginated primary needs it to fill the leading
             // columns; scrolled mode needs it so scrolling up reveals the
@@ -3786,7 +3823,16 @@ export class Paginator extends HTMLElement {
                     await this.#loadAdjacentSection(prevIdx)
             }
             if (!this.scrolled) await loadPrev()
-            await this.scrollToAnchor(resolvedAnchor, select)
+            if (current && !current()) {
+                if (this.#views.has(previousIndex)) {
+                    this.#primaryIndex = previousIndex
+                    this.#syncA11y()
+                }
+                this.#container.style.opacity = '1'
+                this.#stabilizing = false
+                return false
+            }
+            await this.scrollToAnchor(resolvedAnchor ?? 0, select)
             if (this.scrolled) await loadPrev()
             if (blank) this.#container.style.opacity = '1'
             if (hasFocus) this.focusView()
@@ -3795,6 +3841,24 @@ export class Paginator extends HTMLElement {
             this.#fillPromise = this.#fillVisibleArea()
             this.#fillPromise.then(() => { this.#stabilizing = false })
         } else {
+            // Source acquisition does not commit a page change. A failing
+            // load or superseded request leaves the visible views intact.
+            let src, data
+            try {
+                src = await section.load()
+                data = await section.loadContent?.()
+            } catch (e) {
+                console.warn(new Error(`Failed to load section ${index}`, { cause: e }))
+                return current ? false : undefined
+            }
+            if (!src || (current && !current())) return current ? false : undefined
+            // Background preloading may have finished this same view while
+            // the source was acquired. Reuse it instead of tearing it down.
+            const preloaded = this.#views.get(index)
+            if (preloaded && !directionChanged && await preloaded.loadReady
+                && this.#views.get(index) === preloaded)
+                return this.#goTo({ index, anchor, select, current })
+            if (current && !current()) return false
             // When direction changes, clear ALL views — no reuse possible
             // across writing-mode boundaries. When direction is unknown
             // (not yet cached), keep nearby views; #beforeRender will
@@ -3817,21 +3881,14 @@ export class Paginator extends HTMLElement {
                 this.setStyles(this.#styles)
                 this.dispatchEvent(new CustomEvent('load', { detail }))
             }
-            await this.#display(Promise.resolve(section.load())
-                .then(async src => {
-                    const data = await section.loadContent?.()
-                    return { index, src, data, anchor, onLoad, select }
-                }).catch(e => {
-                    console.warn(e)
-                    console.warn(new Error(`Failed to load section ${index}`))
-                    return {}
-                }))
+            return this.#display(Promise.resolve({ index, src, data, anchor, onLoad, select, current }))
         }
     }
     async goTo(target) {
         if (this.#locked) return
         const resolved = await target
-        if (this.#canGoToIndex(resolved.index)) return this.#goTo(resolved)
+        if (resolved && (!resolved.current || resolved.current())
+            && this.#canGoToIndex(resolved.index)) return this.#goTo(resolved)
     }
     #scrollPrev(distance) {
         if (this.#views.size === 0) return true

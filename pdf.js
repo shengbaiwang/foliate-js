@@ -386,6 +386,8 @@ const render = async (page, doc, zoom, pageColors, ocr, onCommit) => {
     return generation
 }
 
+const chapterViewports = new WeakMap()
+
 const renderPage = async (page, getImageBlob, ocr = null, prepareOCR, labels) => {
     const viewport = page.getViewport({ scale: 1 })
     if (getImageBlob) {
@@ -428,6 +430,7 @@ const renderPage = async (page, getImageBlob, ocr = null, prepareOCR, labels) =>
     `
     const src = URL.createObjectURL(new Blob([data], { type: 'text/html' }))
     const onZoom = async ({ doc, scale, pageColors, onCommit }) => {
+        chapterViewports.set(doc, page.getViewport({ scale }))
         const generation = await render(page, doc, scale, pageColors, ocr, onCommit)
         if (generation == null || renderGenerations.get(doc) !== generation) return false
         const container = doc.querySelector('.textLayer')
@@ -444,6 +447,8 @@ const renderPage = async (page, getImageBlob, ocr = null, prepareOCR, labels) =>
         // its earlier empty OCR snapshot. Publish the now-ready words too.
         if (ocr && !container?.textContent?.trim()) publish(ocr)
         if (!prepareOCR || ocr || container?.textContent?.trim()) {
+            if (!ocr && container?.textContent?.trim())
+                doc.dispatchEvent(new Event('pdf-text-ready'))
             doc.querySelector('[data-pdf-ocr-status]')?.remove()
             return true
         }
@@ -502,30 +507,18 @@ const makeTOCItem = async (item, resolve, destinations) => {
     }
 }
 
-const destinationAnchor = (page, dest) => {
-    const viewport = page.getViewport({ scale: 1 })
+const destinationPoint = (viewport, dest) => {
     const mode = dest[1]?.name
     const left = mode === 'XYZ' || mode === 'FitR' || mode === 'FitV' || mode === 'FitBV'
         ? dest[2] : null
     const top = mode === 'XYZ' ? dest[3] : mode === 'FitR' ? dest[5]
         : mode === 'FitH' || mode === 'FitBH' ? dest[2] : null
     if (!Number.isFinite(top) && !Number.isFinite(left)) return
-    const [x, y] = viewport.convertToViewportPoint(left ?? 0, top ?? viewport.viewBox[3])
-    return doc => {
-        const layer = doc.querySelector('.textLayer')
-        const scale = parseFloat(doc.documentElement.style.getPropertyValue('--total-scale-factor')) || 1
-        let closest, distance = Infinity
-        for (const span of layer?.querySelectorAll('span') ?? []) {
-            if (!span.textContent) continue
-            const rect = span.getBoundingClientRect()
-            const d = Math.abs(rect.top - y * scale) + Math.abs(rect.left - x * scale) * 0.1
-            if (d < distance) { closest = span; distance = d }
-        }
-        if (!closest) return Math.max(0, Math.min(1, y / viewport.height))
-        const range = doc.createRange()
-        range.selectNodeContents(closest)
-        return range
-    }
+    const [x, y] = viewport.convertToViewportPoint(left ?? viewport.viewBox[0],
+        top ?? viewport.viewBox[3])
+    const clamp = (n, max) => Math.max(0, Math.min(max, n))
+    return { x: clamp(x, viewport.width), y: clamp(y, viewport.height),
+        hasX: Number.isFinite(left), hasY: Number.isFinite(top) }
 }
 
 // Cache of decoded pdf.js page objects and their rendered HTML blobs. These are
@@ -945,10 +938,39 @@ export const makePDF = async (file, { loadOCR, recognizeOCR, disposeOCR, ocrLabe
         if (!target) return
         const { index, dest } = target
         const page = await getPage(index)
-        return { index, anchor: destinationAnchor(page, dest) }
+        const base = page.getViewport({ scale: 1 })
+        if (!destinationPoint(base, dest)) return { index }
+        return { index, anchor: doc => {
+            const viewport = chapterViewports.get(doc) ?? base
+            const { x, y } = destinationPoint(viewport, dest)
+            // A PDF destination is a point on the physical page. Do not snap
+            // it to a nearby line in a different column or fabricate a CFI.
+            return { ownerDocument: doc, getBoundingClientRect: () => new DOMRect(x, y) }
+        } }
     }
     book.splitTOCHref = href => [destinations.get(href)?.index ?? null, null]
     book.getTOCFragment = doc => doc.documentElement
+    book.getChapterAnchor = (doc, href) => {
+        const dest = destinations.get(href)?.dest
+        const viewport = chapterViewports.get(doc)
+        if (!dest || !viewport) return
+        const point = destinationPoint(viewport, dest)
+        if (!point?.hasY) return
+        // A missing horizontal coordinate cannot identify a row on a rotated
+        // page or choose between parallel columns. Only use a unique hit.
+        if (!point.hasX && viewport.rotation % 180 !== 0) return
+        const { x, y } = point
+        const hits = []
+        for (const span of doc.querySelectorAll('.textLayer span')) {
+            if (!span.textContent?.trim() || span.querySelector('span')) continue
+            const r = span.getBoundingClientRect()
+            if (!r.height || Math.abs(r.top - y) > Math.min(3, r.height / 3)) continue
+            if (point.hasX && (x < r.left - 3 || x > r.right + 3)) continue
+            hits.push(span)
+            if (hits.length > 1) return
+        }
+        return hits[0]
+    }
     book.getCover = async () => renderPage(await pdf.getPage(1), true)
     book.destroy = () => {
         stop()

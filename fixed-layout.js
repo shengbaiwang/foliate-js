@@ -1834,34 +1834,40 @@ export class FixedLayout extends HTMLElement {
             if (center === section) return { index, side: 'center' }
         }
     }
-    async goToSpread(index, side, reason) {
+    async goToSpread(index, side, reason, current = () => true) {
         this.#cancelGesture()
         if (index < 0 || index > this.#spreads.length - 1) return
         if (index === this.#index) {
             if (side) this.#side = side
             await Promise.all(this.#render(side))
-            this.#reportLocation(reason)
+            if (current()) this.#reportLocation(reason)
             return
         }
-        this.#index = index
+        if (!current()) return
         const spread = this.#spreads[index]
         const cacheKey = `spread-${index}`
         const cached = this.#preloadCache.get(cacheKey)
         if (cached && cached !== 'loading') {
             if (cached.center) {
                 const sectionIndex = this.book.sections.indexOf(spread.center)
+                if (!current()) return
+                this.#index = index
                 await this.#showSpread({ center: { index: sectionIndex, src: cached.center }, spreadIndex: index, side })
             } else {
                 const indexL = this.book.sections.indexOf(spread.left)
                 const indexR = this.book.sections.indexOf(spread.right)
                 const left = { index: indexL, src: cached.left }
                 const right = { index: indexR, src: cached.right }
+                if (!current()) return
+                this.#index = index
                 await this.#showSpread({ left, right, side, spreadIndex: index })
             }
         } else {
             if (spread.center) {
                 const sectionIndex = this.book.sections.indexOf(spread.center)
                 const src = await spread.center?.load?.()
+                if (!current()) return
+                this.#index = index
                 await this.#showSpread({ center: { index: sectionIndex, src }, spreadIndex: index, side })
             } else {
                 const indexL = this.book.sections.indexOf(spread.left)
@@ -1870,11 +1876,13 @@ export class FixedLayout extends HTMLElement {
                 const srcR = await spread.right?.load?.()
                 const left = { index: indexL, src: srcL }
                 const right = { index: indexR, src: srcR }
+                if (!current()) return
+                this.#index = index
                 await this.#showSpread({ left, right, side, spreadIndex: index })
             }
         }
 
-        this.#reportLocation(reason)
+        if (current()) this.#reportLocation(reason)
         this.#preloadNextSpreads()
     }
     #preloadNextSpreads() {
@@ -2043,27 +2051,33 @@ export class FixedLayout extends HTMLElement {
         const resolved = await target
         this.#clampedZoomAnchor = null
         if (!resolved || !this.book.sections[resolved.index]) return
+        const current = resolved.current ?? (() => true)
+        if (!current()) return
         if (this.#scrollMode) {
             const page = this.#scrollPages[resolved.index]
             if (page) {
-                page.el.scrollIntoView(
-                    this.#scrollHorizontal ? { inline: 'start', block: 'nearest' } : undefined)
-                this.#scrollCurrentIndex = resolved.index
                 await this.#loadScrollPage(page)
                 await page.frame?.renderPromise
+                if (!current() || !page.frame) return false
                 const doc = page.frame?.iframe?.contentDocument
                 const anchor = typeof resolved.anchor === 'function' && doc
                     ? resolved.anchor(doc) : resolved.anchor
+                if (resolved.anchor && anchor == null) return false
+                page.el.scrollIntoView(
+                    this.#scrollHorizontal ? { inline: 'start', block: 'nearest' } : undefined)
+                this.#scrollCurrentIndex = resolved.index
                 if (anchor != null) this.scrollToAnchor(anchor)
                 this.#reportLocation('navigation')
+                return
             }
-            return
+            return false
         }
         const { book } = this
         const section = book.sections[resolved.index]
         if (!section) return
         const { index, side } = this.getSpreadOf(section)
-        await this.goToSpread(index, side)
+        await this.goToSpread(index, side, 'navigation', current)
+        if (!current()) return
         const doc = this.getContents().find(content => content.index === resolved.index)?.doc
         const anchor = typeof resolved.anchor === 'function' && doc
             ? resolved.anchor(doc) : resolved.anchor
