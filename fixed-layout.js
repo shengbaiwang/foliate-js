@@ -260,9 +260,8 @@ export class FixedLayout extends HTMLElement {
     #scrollIdleTimer = null
     #paginatedLocationTimer = null
     #scrollCurrentIndex = -1
-    // True while the host is actively scrolling. Pages load interactive only
-    // when idle so a page that finishes loading mid-scroll can't flip its iframe
-    // interactive and let its own pointer handlers hijack the native scroll.
+    #scrollNavigationPage = null
+    // Delay continuous-layout location updates until scrolling settles.
     #scrolling = false
     // True while a pinch gesture is live. Suppresses page load/eviction so the
     // placeholder layout (and thus scrollTop) can't drift mid-pinch, which would
@@ -1242,19 +1241,16 @@ export class FixedLayout extends HTMLElement {
             maxLoaded: this.#scrollMaxLoaded,
             maxConcurrent: this.#scrollMaxConcurrent,
             loadingCount: this.#scrollLoadingCount,
-            pinnedIndices: this.#selectionPages,
+            pinnedIndices: this.#scrollNavigationPage
+                ? [...this.#selectionPages, this.#scrollNavigationPage.index]
+                : this.#selectionPages,
         })
         for (const index of evict) this.#teardownScrollPage(this.#scrollPages[index])
         for (const index of load) this.#loadScrollPage(this.#scrollPages[index])
     }
     #handleScrollEvent = () => {
-        // Drop iframe interaction while the host is actively scrolling so the
-        // scroll stays native-smooth (the iframe's own pointer handlers can't
-        // hijack it), then restore it on settle so text selection, taps, and
-        // same-page pinch work again. (Cross-page pinch is intentionally not
-        // supported in this mode: a gesture spanning two page iframes can't be
-        // owned by one document — keeping the iframes interactive is the
-        // trade-off for native selection.)
+        // Non-PDF frames yield pointer interaction to the native scroller
+        // during movement. PDF frames retain selection, pinch and links.
         this.#scrolling = true
         this.#setScrollIframeInteraction(false)
         if (this.#scrollIdleTimer) clearTimeout(this.#scrollIdleTimer)
@@ -1277,7 +1273,10 @@ export class FixedLayout extends HTMLElement {
         this.scrollBy({ left: delta.left, behavior: 'auto' })
     }
     #setScrollIframeInteraction(enabled) {
-        const value = enabled || this.#panning || this.#zoomGesture || this.hasAttribute('zoom-preview')
+        // PDF pages handle selection and pinch in their own documents. Keep
+        // link hit targets reachable between wheel/trackpad ticks as well.
+        const value = enabled || this.book?.getPDFAnnotationRects
+            || this.#panning || this.#zoomGesture || this.hasAttribute('zoom-preview')
             || this.#selectionPages.length ? 'auto' : ''
         for (const page of this.#scrollPages) {
             if (page.frame?.iframe) {
@@ -1445,11 +1444,8 @@ export class FixedLayout extends HTMLElement {
             if (this.#scrollLoadGen.get(pageData.index) !== gen
                 || pageData.frame !== frame || !this.#scrollMode) return
 
-            // Make the page interactive right away when idle so text selection
-            // and taps work without first scrolling. While scrolling, leave it
-            // inert (the scroll-settle handler turns it back on) so its pointer
-            // handlers can't hijack the native scroll.
-            if (!this.#scrolling && !this.#pinching && frame.iframe) {
+            // Match the interaction policy of the other loaded frames.
+            if ((!this.#scrolling || this.book?.getPDFAnnotationRects) && !this.#pinching && frame.iframe) {
                 frame.iframe.style.pointerEvents = 'auto'
             }
 
@@ -1466,9 +1462,7 @@ export class FixedLayout extends HTMLElement {
                         },
                     },
                 }))
-                // During the brief idle window after scrolling settles the
-                // iframe is interactive (pointer-events: auto), so the first
-                // wheel tick of a new gesture lands on it (readest#4727).
+                // Interactive frames receive wheel ticks (readest#4727).
                 // Vertical mode: the browser already chains that tick to the
                 // host scroller natively (a single smooth scroll, matching the
                 // page margins) — so JS must NOT scroll the host itself, or the
@@ -1476,7 +1470,7 @@ export class FixedLayout extends HTMLElement {
                 // jumps twice as far in an instant lurch. Horizontal mode: the
                 // host only overflows horizontally, so native chaining cannot
                 // consume a vertical tick at all — without translating it here,
-                // the first tick of every gesture over a page is simply lost.
+                // wheel ticks over a page would be lost.
                 // computeScrollWheelDelta returns null whenever `horizontal` is
                 // false, so this never scrolls in the vertical case, and its
                 // other guards (pinch, vertical overflow, horizontal-dominant
@@ -1734,6 +1728,9 @@ export class FixedLayout extends HTMLElement {
         const section = spread.center ?? (this.#side === 'left'
             ? spread.left ?? spread.right : spread.right ?? spread.left)
         return this.book.sections.indexOf(section)
+    }
+    get primaryIndex() {
+        return this.index
     }
     get scale() {
         const page = this.#scrollMode && this.#scrollPages[this.index]
@@ -2055,7 +2052,11 @@ export class FixedLayout extends HTMLElement {
         if (!current()) return
         if (this.#scrollMode) {
             const page = this.#scrollPages[resolved.index]
-            if (page) {
+            if (!page) return false
+            // The load scheduler runs before this request scrolls. Retain the
+            // offscreen destination until it enters the viewport.
+            this.#scrollNavigationPage = page
+            try {
                 await this.#loadScrollPage(page)
                 await page.frame?.renderPromise
                 if (!current() || !page.frame) return false
@@ -2068,9 +2069,10 @@ export class FixedLayout extends HTMLElement {
                 this.#scrollCurrentIndex = resolved.index
                 if (anchor != null) this.scrollToAnchor(anchor)
                 this.#reportLocation('navigation')
-                return
+            } finally {
+                if (this.#scrollNavigationPage === page) this.#scrollNavigationPage = null
             }
-            return false
+            return
         }
         const { book } = this
         const section = book.sections[resolved.index]

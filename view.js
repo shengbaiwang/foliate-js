@@ -633,7 +633,7 @@ export class View extends HTMLElement {
             return { index, anchor }
         }
     }
-    resolveNavigation(target) {
+    resolveNavigation(target, current) {
         try {
             if (typeof target === 'number') return { index: target }
             if (typeof target?.resourceIndex === 'number') {
@@ -648,7 +648,7 @@ export class View extends HTMLElement {
                 return { index, anchor }
             }
             if (CFI.isCFI.test(target)) return this.resolveCFI(target)
-            return this.book.resolveHref(target)
+            return this.book.resolveHref(target, current)
         } catch (e) {
             console.error(e)
             console.error(`Could not resolve target ${target}`)
@@ -702,7 +702,7 @@ export class View extends HTMLElement {
             const node = nodeId ? chapters.node(nodeId) : chapters.byHref(target)
             if (nodeId && !node) return false
             const destination = node?.item.href ?? target
-            resolved = await this.resolveNavigation(destination)
+            resolved = await this.resolveNavigation(destination, valid)
             if (!valid() || !book.sections[resolved?.index]) return false
             if (!this.isFixedLayout && typeof destination === 'string'
                 && !CFI.isCFI.test(destination) && resolved.anchor

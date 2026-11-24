@@ -382,6 +382,7 @@ const render = async (page, doc, zoom, pageColors, ocr, onCommit) => {
     }
     await new pdfjsLib.AnnotationLayer({ page, viewport: displayViewport, div, linkService }).render({
         annotations: await page.getAnnotations(),
+        imageResourcesPath: pdfjsPath('images/'),
     })
     return generation
 }
@@ -521,6 +522,22 @@ const destinationPoint = (viewport, dest) => {
         hasX: Number.isFinite(left), hasY: Number.isFinite(top) }
 }
 
+const printedFolio = (content, viewport, pageCount) => {
+    const folios = new Map()
+    for (const item of content.items) {
+        const match = item.str?.normalize('NFKC').trim().match(/^(\d+)\s*\/\s*(\d+)$/)
+        if (!match || !item.transform) continue
+        const number = Number(match[1]), total = Number(match[2])
+        if (number < 1 || number > total || total > pageCount) continue
+        const [x, y] = viewport.convertToViewportPoint(
+            item.transform[4] + (item.width ?? 0) / 2, item.transform[5])
+        if (y < viewport.height * .92 || y > viewport.height
+            || x < 0 || x > viewport.width) continue
+        folios.set(`${number}/${total}`, { number, total })
+    }
+    return folios.size === 1 ? folios.values().next().value : null
+}
+
 // Cache of decoded pdf.js page objects and their rendered HTML blobs. These are
 // cheap (page metadata + a small blob URL, not the large canvas bitmap, which
 // lives in the visible iframe) so this can comfortably exceed the live-canvas
@@ -567,17 +584,8 @@ const parseCalibreSeriesFromXMP = raw => {
 // WebView's heap, crashing on 50 MB+ PDFs (readest #3470). Throttle here.
 const MAX_CONCURRENT_RANGES = 6
 
-/**
- * @param {File} file
- * @param {{
- *   loadOCR?: (index: number) => Promise<object | null>,
- *   recognizeOCR?: (index: number, current: () => boolean) => Promise<object | null>,
- *   disposeOCR?: () => unknown,
- *   ocrLabels?: { loading: string, failed: string },
- *   importOnly?: boolean,
- * }} [options]
- */
-export const makePDF = async (file, { loadOCR, recognizeOCR, disposeOCR, ocrLabels, importOnly = false } = {}) => {
+// The reader and publisher use the same PDF.js range settings and embedded resources.
+const openRangeDocument = async (file, worker) => {
     const transport = new pdfjsLib.PDFDataRangeTransport(file.size, [])
     // Bound the concurrent range reads instead of dispatching them all at once.
     let active = 0
@@ -598,6 +606,11 @@ export const makePDF = async (file, { loadOCR, recognizeOCR, disposeOCR, ocrLabe
     }
     const queue = []
     const stop = () => { stopped = true; queue.length = 0 }
+    let closing
+    const destroy = () => {
+        stop()
+        return closing ??= Promise.resolve().then(() => loadingTask.destroy())
+    }
     const fail = error => {
         if (stopped) return
         stop()
@@ -606,7 +619,7 @@ export const makePDF = async (file, { loadOCR, recognizeOCR, disposeOCR, ocrLabe
             ? message : 'pdf_range_read_failed')
         for (const reject of pendingReads) reject(rangeError)
         pendingReads.clear()
-        Promise.resolve().then(() => loadingTask?.destroy?.()).catch(() => {})
+        destroy().catch(() => {})
     }
     const pump = () => {
         while (!stopped && active < MAX_CONCURRENT_RANGES && queue.length) {
@@ -632,6 +645,9 @@ export const makePDF = async (file, { loadOCR, recognizeOCR, disposeOCR, ocrLabe
     }
     loadingTask = pdfjsLib.getDocument({
         range: transport,
+        worker,
+        disableAutoFetch: file.glossaRangeSource === true,
+        disableStream: file.glossaRangeSource === true,
         wasmUrl: pdfjsPath(''),
         cMapUrl: pdfjsPath('cmaps/'),
         standardFontDataUrl: pdfjsPath('standard_fonts/'),
@@ -640,13 +656,119 @@ export const makePDF = async (file, { loadOCR, recognizeOCR, disposeOCR, ocrLabe
     const openPart = async promise => {
         try { return await withRanges(promise) }
         catch (error) {
-            stop()
-            // Range failures already destroy the loading task in fail().
-            if (!rangeError) await Promise.resolve(loadingTask.destroy()).catch(() => {})
+            await destroy().catch(() => {})
             throw error
         }
     }
     const pdf = await openPart(loadingTask.promise)
+    return { pdf, withRanges, openPart, destroy, stop }
+}
+
+// Keep search offsets identical on the publishing and reading devices.
+const pageTextDocument = async (page, ocr) => {
+    const doc = document.implementation.createHTMLDocument('')
+
+    const canvas = doc.createElement('div')
+    canvas.id = 'canvas'
+    doc.body.appendChild(canvas)
+
+    const textLayer = doc.createElement('div')
+    textLayer.className = 'textLayer'
+    doc.body.appendChild(textLayer)
+
+    const annotationLayer = doc.createElement('div')
+    annotationLayer.className = 'annotationLayer'
+    doc.body.appendChild(annotationLayer)
+
+    // TextLayer requires canvas 2d context for font metrics;
+    // fall back to manual span construction when unavailable
+    const probe = doc.createElement('canvas')
+    if (probe.getContext?.('2d')) {
+        const textLayerInstance = new pdfjsLib.TextLayer({
+            textContentSource: await page.streamTextContent(),
+            container: textLayer, viewport: page.getViewport({ scale: 1 }),
+        })
+        await textLayerInstance.render()
+    } else {
+        const content = await readTextContent(page)
+        for (const item of content.items) {
+            if (item.str) {
+                const span = doc.createElement('span')
+                span.textContent = item.str
+                textLayer.appendChild(span)
+            }
+        }
+    }
+    appendOCR(textLayer, ocr, page.getViewport({ scale: 1 }))
+    return doc
+}
+
+// Reuse the worker process but start each page with a fresh document and byte
+// cache. Otherwise a shared font or image fetched for page 1 disappears from
+// the trace for page 2. The trace describes this renderer and display intent.
+export const createPDFRangeProbe = () => {
+    const worker = new pdfjsLib.PDFWorker()
+    return {
+        version: pdfjsLib.version,
+        close: () => worker.destroy(),
+        async inspect(file, index, countOnly = false, search, preview) {
+            const { pdf, withRanges, destroy } = await openRangeDocument(file, worker)
+            const canvas = document.createElement('canvas')
+            const paint = async (page, number) => {
+                const base = page.getViewport({ scale: 1 })
+                const edge = preview && number < 3 ? preview.edge : 256
+                const viewport = page.getViewport({ scale: edge / Math.max(base.width, base.height) })
+                canvas.width = Math.min(edge, Math.max(1, Math.ceil(viewport.width)))
+                canvas.height = Math.min(edge, Math.max(1, Math.ceil(viewport.height)))
+                await withRanges(page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise)
+                if (preview && number < 3) {
+                    // Encoding a preview is optional even when the display trace succeeds.
+                    try { preview.add(number, canvas) } catch { /* later pages cannot fill this gap */ }
+                }
+            }
+            try {
+                if (countOnly) {
+                    // A single CAS chunk is already resident. Reuse one document for previews and text.
+                    if (preview) for (let i = 0; i < Math.min(3, pdf.numPages); i++) {
+                        const page = await withRanges(pdf.getPage(i + 1))
+                        try { await paint(page, i) } finally { page.cleanup() }
+                    }
+                    if (search && pdf.numPages <= 16384) for (let i = 0; i < pdf.numPages && search.enabled; i++) {
+                        const page = await withRanges(pdf.getPage(i + 1))
+                        try { await search.add(i, await withRanges(pageTextDocument(page))) }
+                        catch { search.discard() }
+                        finally { page.cleanup() }
+                    }
+                    return pdf.numPages
+                }
+                const page = await withRanges(pdf.getPage(index + 1))
+                await paint(page, index)
+                await withRanges(page.getAnnotations({ intent: 'display' }))
+                if (search?.enabled) {
+                    try { await search.add(index, await withRanges(pageTextDocument(page))) }
+                    catch { search.discard() }
+                }
+                return pdf.numPages
+            } finally {
+                canvas.width = canvas.height = 0
+                await destroy()
+            }
+        },
+    }
+}
+
+/**
+ * @param {File} file
+ * @param {{
+ *   loadOCR?: (index: number) => Promise<object | null>,
+ *   recognizeOCR?: (index: number, current: () => boolean) => Promise<object | null>,
+ *   disposeOCR?: () => unknown,
+ *   ocrLabels?: { loading: string, failed: string },
+ *   importOnly?: boolean,
+ * }} [options]
+ */
+export const makePDF = async (file, { loadOCR, recognizeOCR, disposeOCR, ocrLabels, importOnly = false } = {}) => {
+    const { pdf, withRanges, openPart, destroy, stop } = await openRangeDocument(file)
 
     // Get viewport dimensions from first page for fixed-layout rendering
     const firstPage = await openPart(pdf.getPage(1))
@@ -682,9 +804,8 @@ export const makePDF = async (file, { loadOCR, recognizeOCR, disposeOCR, ocrLabe
         book.sections = []
         book.getCover = () => withRanges(renderPage(firstPage, true))
         book.destroy = () => {
-            stop()
             disposeOCR?.()
-            return loadingTask.destroy()
+            return destroy()
         }
         return book
     }
@@ -695,6 +816,7 @@ export const makePDF = async (file, { loadOCR, recognizeOCR, disposeOCR, ocrLabe
     book.toc = outline?.length
         ? await openPart(Promise.all(outline.map(item => makeTOCItem(item, resolve, destinations)))) : []
     const labels = await openPart(pdf.getPageLabels?.())
+    book.getPDFPageLabels = () => labels ? [...labels] : null
     book.pageList = Array.from({ length: pdf.numPages }, (_, index) => {
         const dest = [index, { name: 'Fit' }]
         const href = JSON.stringify(dest)
@@ -723,6 +845,7 @@ export const makePDF = async (file, { loadOCR, recognizeOCR, disposeOCR, ocrLabe
             pageCache.set(i, cached)
             return cached
         }
+        if (file.warmPdfPage) await file.warmPdfPage(i, pdfjsLib.version)
         const page = await withRanges(pdf.getPage(i + 1))
         pageCache.set(i, page)
 
@@ -735,6 +858,21 @@ export const makePDF = async (file, { loadOCR, recognizeOCR, disposeOCR, ocrLabe
         }
 
         return page
+    }
+    if (!labels) {
+        const printedPages = new Map()
+        book.getPDFPrintedPage = index => {
+            if (!Number.isInteger(index) || index < 0 || index >= pdf.numPages)
+                return Promise.resolve(null)
+            if (!printedPages.has(index)) {
+                const read = getPage(index).then(async page => printedFolio(
+                    await withRanges(readTextContent(page)), page.getViewport({ scale: 1 }),
+                    pdf.numPages))
+                printedPages.set(index, read)
+                read.catch(() => printedPages.delete(index))
+            }
+            return printedPages.get(index)
+        }
     }
     book.sections = Array.from({ length: pdf.numPages }).map((_, i) => ({
         id: i,
@@ -760,49 +898,13 @@ export const makePDF = async (file, { loadOCR, recognizeOCR, disposeOCR, ocrLabe
 
             return url
         },
-        createDocument: async () => {
-            const page = await getPage(i)
-            const doc = document.implementation.createHTMLDocument('')
-
-            const canvas = doc.createElement('div')
-            canvas.id = 'canvas'
-            doc.body.appendChild(canvas)
-
-            const textLayer = doc.createElement('div')
-            textLayer.className = 'textLayer'
-            doc.body.appendChild(textLayer)
-
-            const annotationLayer = doc.createElement('div')
-            annotationLayer.className = 'annotationLayer'
-            doc.body.appendChild(annotationLayer)
-
-            // TextLayer requires canvas 2d context for font metrics;
-            // fall back to manual span construction when unavailable
-            const probe = doc.createElement('canvas')
-            if (probe.getContext?.('2d')) {
-                const textLayerInstance = new pdfjsLib.TextLayer({
-                    textContentSource: await page.streamTextContent(),
-                    container: textLayer, viewport: page.getViewport({ scale: 1 }),
-                })
-                await textLayerInstance.render()
-            } else {
-                const content = await readTextContent(page)
-                for (const item of content.items) {
-                    if (item.str) {
-                        const span = doc.createElement('span')
-                        span.textContent = item.str
-                        textLayer.appendChild(span)
-                    }
-                }
-            }
-            appendOCR(textLayer, await loadOCR?.(i), page.getViewport({ scale: 1 }))
-            return doc
-        },
+        createDocument: async () => pageTextDocument(await getPage(i), await loadOCR?.(i)),
         size: 1000,
     }))
     book.isExternal = uri => /^\w+:/i.test(uri)
     // Separate bounded bitmap work from the reader's text layers and CFI cache.
-    book.getPDFImage = async (index, width = 180, region) => {
+    book.getPDFImage = async (index, width = 180, region, signal) => {
+        signal?.throwIfAborted()
         if (!Number.isInteger(index) || index < 0 || index >= pdf.numPages
             || !Number.isFinite(width) || width < 1 || width > 3200)
             throw new Error('invalid_pdf_image')
@@ -812,6 +914,7 @@ export const makePDF = async (file, { loadOCR, recognizeOCR, disposeOCR, ocrLabe
             || r.x + r.width > 1.001 || r.y + r.height > 1.001)
             throw new Error('invalid_pdf_region')
         const page = await getPage(index)
+        signal?.throwIfAborted()
         const base = page.getViewport({ scale: 1 })
         const scale = Math.min(width / (base.width * r.width),
             Math.sqrt(4_000_000 / (base.width * base.height * r.width * r.height)))
@@ -819,13 +922,20 @@ export const makePDF = async (file, { loadOCR, recognizeOCR, disposeOCR, ocrLabe
         const canvas = document.createElement('canvas')
         canvas.width = Math.max(1, Math.ceil(viewport.width * r.width))
         canvas.height = Math.max(1, Math.ceil(viewport.height * r.height))
-        try {
-            await page.render({ canvasContext: canvas.getContext('2d'), viewport,
+        const task = page.render({ canvasContext: canvas.getContext('2d'), viewport,
                 transform: [1, 0, 0, 1, -r.x * viewport.width, -r.y * viewport.height],
-                background: '#ffffff' }).promise
+                background: '#ffffff' })
+        const cancel = () => task.cancel()
+        signal?.addEventListener('abort', cancel, { once: true })
+        try {
+            await withRanges(task.promise)
+            signal?.throwIfAborted()
             return await new Promise((resolve, reject) => canvas.toBlob(
                 blob => blob ? resolve(blob) : reject(new Error('pdf_image_failed')), 'image/png'))
-        } finally { canvas.width = canvas.height = 0 }
+        } finally {
+            signal?.removeEventListener('abort', cancel)
+            canvas.width = canvas.height = 0
+        }
     }
     book.getPDFText = async index => {
         const content = await withRanges(readTextContent(await getPage(index)))
@@ -929,7 +1039,26 @@ export const makePDF = async (file, { loadOCR, recognizeOCR, disposeOCR, ocrLabe
             return { index, rects }
         } finally { clearTimeout(timer); frame.remove(); URL.revokeObjectURL(entry.src) }
     }
-    book.resolveHref = async href => {
+    book.resolveHref = async (href, current = () => true) => {
+        const printed = typeof href === 'string' && href.match(/^pdf-printed-page:(\d+)\/(\d+)$/)
+        if (printed && book.getPDFPrintedPage) {
+            const number = Number(printed[1]), total = Number(printed[2])
+            if (number < 1 || number > total || total > pdf.numPages) return
+            let found
+            // Keep only small folio records. Read in bounded batches and stop
+            // when superseded. A duplicate label cannot select a unique page.
+            for (let start = 0; start < pdf.numPages && current(); start += 4) {
+                const indices = Array.from({ length: Math.min(4, pdf.numPages - start) },
+                    (_, offset) => start + offset)
+                const folios = await Promise.all(indices.map(book.getPDFPrintedPage))
+                for (const [offset, folio] of folios.entries()) {
+                    if (folio?.number !== number || folio.total !== total) continue
+                    if (found) return
+                    found = { index: indices[offset] }
+                }
+            }
+            return current() ? found : undefined
+        }
         let target = destinations.get(href)
         if (!target) {
             try { target = await resolve(JSON.parse(href)) }
@@ -984,7 +1113,7 @@ export const makePDF = async (file, { loadOCR, recognizeOCR, disposeOCR, ocrLabe
             page?.cleanup()
         }
         pageCache.clear()
-        pdf.destroy()
+        return pdf.destroy()
     }
     return book
 }
