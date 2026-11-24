@@ -205,7 +205,7 @@ export const applyOverlayerViewBox = (frame, overlayer) => {
 }
 
 export class FixedLayout extends HTMLElement {
-    static observedAttributes = ['zoom', 'scale-factor', 'zoom-preview', 'fit-viewport', 'spread', 'flow', 'scroll-gap', 'scroll-direction']
+    static observedAttributes = ['zoom', 'scale-factor', 'zoom-preview', 'fit-viewport', 'atlas-trim', 'atlas-rotation', 'spread', 'flow', 'scroll-gap', 'scroll-direction']
     #root = this.attachShadow({ mode: 'open' })
     #observer = new ResizeObserver(() => this.#scheduleResize())
     #resizeFrame = null
@@ -218,6 +218,10 @@ export class FixedLayout extends HTMLElement {
     #index = -1
     defaultViewport
     spread
+    #atlasBox
+    #atlasSheet
+    #navigationSerial = 0
+    #pendingSection
     #portrait = false
     #left
     #right
@@ -393,6 +397,14 @@ export class FixedLayout extends HTMLElement {
             detail: { level: Math.round(this.scale * 100) },
         }))
     }
+    #pagePoint(frame, u, v) {
+        const angle = this.#atlasSheet && !this.#scrollMode
+            ? Number(this.getAttribute('atlas-rotation')) : 0
+        if (angle === 90) [u, v] = [1 - v, u]
+        else if (angle === 180) [u, v] = [1 - u, 1 - v]
+        else if (angle === 270) [u, v] = [v, 1 - u]
+        return { x: frame.left + u * frame.width, y: frame.top + v * frame.height }
+    }
     #attachPDFZoom(target) {
         if (this.#zoomDocuments.has(target)) return
         this.#zoomDocuments.add(target)
@@ -400,8 +412,7 @@ export class FixedLayout extends HTMLElement {
             const iframe = target.defaultView?.frameElement
             if (!iframe) return { x: e.clientX, y: e.clientY }
             const rect = iframe.getBoundingClientRect()
-            return { x: rect.left + e.clientX * rect.width / iframe.clientWidth,
-                y: rect.top + e.clientY * rect.height / iframe.clientHeight }
+            return this.#pagePoint(rect, e.clientX / iframe.clientWidth, e.clientY / iframe.clientHeight)
         }
         const consume = e => { e.preventDefault(); e.stopImmediatePropagation() }
         if (target === this) {
@@ -804,6 +815,10 @@ export class FixedLayout extends HTMLElement {
             case 'zoom-preview':
                 if (value === null) this.#render()
                 break
+            case 'atlas-trim':
+            case 'atlas-rotation':
+                if (this.#atlasSheet) this.#render()
+                break
             case 'spread':
                 this.#respread(value)
                 break
@@ -861,7 +876,8 @@ export class FixedLayout extends HTMLElement {
         iframe.setAttribute('sandbox', 'allow-same-origin allow-scripts')
         iframe.setAttribute('scrolling', 'no')
         iframe.setAttribute('part', 'filter')
-        this.#root.append(element)
+        const parent = this.#atlasSheet ?? this.#root
+        parent.append(element)
 
         if (detached) {
             Object.assign(element.style, {
@@ -903,12 +919,60 @@ export class FixedLayout extends HTMLElement {
         const anchor = pageTurn ? null : this.#captureVisualAnchor()
         const index = this.index
         const result = this.#renderLayout(side, pageTurn)
-        if (this.#zoom === 'fit-page' && this.#scaleFactor === 1 && this.hasAttribute('fit-viewport')) {
+        if ((!this.#atlasSheet || this.#scrollMode) && this.#zoom === 'fit-page' && this.#scaleFactor === 1 && this.hasAttribute('fit-viewport')) {
             this.#clampedZoomAnchor = null
             if (this.#scrollMode) this.#scrollCurrentIndex = index
             this.scrollToPageRect(index, { x: 0, y: 0, width: 1, height: 1 }, this.#fitViewport)
         } else this.#restoreVisualAnchor(anchor)
         return result
+    }
+    #renderAtlas(pageTurn) {
+        const frames = this.#center ? [this.#center] : [this.#left, this.#right]
+        if (frames.some(frame => !frame?.width)) return []
+        const trim = this.getAttribute('atlas-trim') ?? '0%'
+        const trims = frames.map(({ width }) => {
+            if (frames.length === 1) return 0
+            const amount = parseFloat(trim) || 0
+            return clamp(trim.endsWith('%') ? width * amount / 100 : amount, 0, width - 1)
+        })
+        const width = frames.reduce((sum, frame, i) => sum + frame.width - trims[i], 0)
+        const height = Math.max(...frames.map(frame => frame.height))
+        const angle = Number(this.getAttribute('atlas-rotation')) || 0
+        const sideways = angle === 90 || angle === 270
+        const boxWidth = sideways ? height : width
+        const boxHeight = sideways ? width : height
+        const viewport = this.#fitViewport
+        const fit = this.#zoom === 'fit-page'
+        const scale = this.#scaleFactor * (typeof this.#zoom === 'number' ? this.#zoom
+            : fit ? Math.min(this.clientWidth * viewport.width / boxWidth,
+                this.clientHeight * viewport.height / boxHeight)
+                : this.clientWidth / boxWidth)
+        if (!(scale > 0)) return []
+        this.#totalScaleFactor = scale
+        this.#portrait = false
+        Object.assign(this.#atlasBox.style, {
+            width: `${boxWidth * scale}px`, height: `${boxHeight * scale}px`,
+            marginBlock: 'auto',
+        })
+        Object.assign(this.#atlasSheet.style, {
+            width: `${width * scale}px`, height: `${height * scale}px`,
+            transform: `translate(-50%, -50%) rotate(${angle}deg)`,
+        })
+        this.#isOverflowX = boxWidth * scale > this.clientWidth
+        this.#isOverflowY = boxHeight * scale > this.clientHeight
+        if (pageTurn) this.scrollTo(0, 0)
+        let x = 0
+        return frames.map((frame, i) => {
+            const innerLeft = i === 1 ? trims[i] : 0
+            const innerRight = i === 0 ? trims[i] : 0
+            Object.assign(frame.element.style, {
+                position: 'absolute', top: '0', left: `${(x - innerLeft) * scale}px`,
+                width: `${frame.width * scale}px`, height: `${frame.height * scale}px`,
+                clipPath: `inset(0 ${innerRight * scale}px 0 ${innerLeft * scale}px)`,
+            })
+            x += frame.width - trims[i]
+            return this.#drawPDFFrame(frame, scale)
+        })
     }
     #renderLayout(side, pageTurn) {
         if (this.#scrollMode) {
@@ -916,6 +980,7 @@ export class FixedLayout extends HTMLElement {
             return []
         }
         if (!side) return []
+        if (this.#atlasSheet) return this.#renderAtlas(pageTurn)
         const left = this.#left ?? {}
         const right = this.#center ?? this.#right ?? {}
         const target = side === 'left' ? left : right
@@ -1078,46 +1143,37 @@ export class FixedLayout extends HTMLElement {
         }
         return renderPromises
     }
-    async #showSpread({ left, right, center, side, spreadIndex }) {
-        this.#left = null
-        this.#right = null
-        this.#center = null
-
-        const cacheKey = spreadIndex !== undefined ? `spread-${spreadIndex}` : null
-        const prerendered = cacheKey ? this.#prerenderedSpreads.get(cacheKey) : null
-
-        if (prerendered) {
-            this.#spreadAccessTime.set(cacheKey, Date.now())
-            if (prerendered.center) {
-                this.#center = prerendered.center
-            } else {
-                this.#left = prerendered.left
-                this.#right = prerendered.right
+    async #showSpread({ left, right, center, side, spreadIndex }, current) {
+        const key = `spread-${spreadIndex}`
+        if (this.#spreadLoads.has(key)) await this.#spreadLoads.get(key)
+        if (!current()) return
+        let frames = this.#prerenderedSpreads.get(key)
+        if (!frames) {
+            if (center) frames = { center: await this.#createFrame(center) }
+            else {
+                const [leftFrame, rightFrame] = await Promise.all([
+                    this.#createFrame(left), this.#createFrame(right),
+                ])
+                frames = { left: leftFrame, right: rightFrame }
             }
-        } else {
-            if (center) {
-                this.#center = await this.#createFrame(center)
-                if (cacheKey) {
-                    this.#prerenderedSpreads.set(cacheKey, { center: this.#center })
-                    this.#spreadAccessTime.set(cacheKey, Date.now())
-                }
-            } else {
-                this.#left = await this.#createFrame(left)
-                this.#right = await this.#createFrame(right)
-                if (cacheKey) {
-                    this.#prerenderedSpreads.set(cacheKey, { left: this.#left, right: this.#right })
-                    this.#spreadAccessTime.set(cacheKey, Date.now())
-                }
+            if (!current()) {
+                for (const frame of Object.values(frames)) frame.element.remove()
+                return
             }
+            this.#prerenderedSpreads.set(key, frames)
         }
-
+        this.#spreadAccessTime.set(key, Date.now())
+        this.#index = spreadIndex
+        this.#center = frames.center
+        this.#left = frames.left
+        this.#right = frames.right
         this.#side = center ? 'center' : this.#left?.blank ? 'right'
             : this.#right?.blank ? 'left' : side
         const visibleFrames = center
             ? [this.#center?.element]
             : [this.#left?.element, this.#right?.element]
 
-        Array.from(this.#root.children).forEach(child => {
+        Array.from((this.#atlasSheet ?? this.#root).children).forEach(child => {
             const isVisible = visibleFrames.includes(child)
             Object.assign(child.style, {
                 position: isVisible ? 'relative' : 'absolute',
@@ -1133,6 +1189,7 @@ export class FixedLayout extends HTMLElement {
         const renderPromises = this.#render(this.#side, true)
         if (renderPromises.length) await Promise.all(renderPromises)
 
+        if (!current()) return
         const showingFrames = center
             ? [this.#center]
             : [this.#left, this.#right]
@@ -1654,7 +1711,7 @@ export class FixedLayout extends HTMLElement {
         this.defaultViewport = book.rendition?.viewport
         this.rtl = book.dir === 'rtl'
 
-        this.#spread()
+        this.#spread(this.getAttribute('spread'))
         if (this.#scrollMode) this.#initScrollMode()
     }
     #spread(mode) {
@@ -1664,7 +1721,24 @@ export class FixedLayout extends HTMLElement {
         const ltr = !rtl
         this.spread = mode || rendition?.spread
 
-        if (this.spread === 'none')
+        this.#atlasBox?.remove()
+        this.#atlasBox = this.#atlasSheet = null
+        if (this.spread === 'atlas' || this.spread === 'atlas-cover') {
+            this.#atlasBox = document.createElement('div')
+            this.#atlasBox.style.cssText = 'position:relative;overflow:hidden;flex:none'
+            this.#atlasSheet = document.createElement('div')
+            this.#atlasSheet.style.cssText = 'position:absolute;left:50%;top:50%;direction:ltr'
+            this.#atlasBox.append(this.#atlasSheet)
+            this.#root.append(this.#atlasBox)
+            if (this.#scrollMode) this.#atlasBox.style.display = 'none'
+            this.#spreads = []
+            for (let i = 0; i < book.sections.length;) {
+                const left = book.sections[i++]
+                if ((i === 1 && this.spread === 'atlas-cover') || i === book.sections.length)
+                    this.#spreads.push({ center: left })
+                else this.#spreads.push({ left, right: book.sections[i++] })
+            }
+        } else if (this.spread === 'none')
             this.#spreads = book.sections.map(section => ({ center: section }))
         else this.#spreads = book.sections.reduce((arr, section, i) => {
             const last = arr[arr.length - 1]
@@ -1700,10 +1774,12 @@ export class FixedLayout extends HTMLElement {
         }, [{}])
     }
     #respread(spreadMode) {
-        if (this.#index === -1) return
-        const section = this.book.sections[this.index]
+        if (!this.book) return
+        const section = this.book.sections[this.index] ?? this.#pendingSection
+        this.#left = this.#right = this.#center = this.#side = null
+        this.#preloadQueue.length = 0
+        this.#spreadLoads.clear()
         this.#spread(spreadMode)
-        const { index } = this.getSpreadOf(section)
         this.#index = -1
         this.#preloadCache.clear()
         for (const frames of this.#prerenderedSpreads.values()) {
@@ -1716,8 +1792,11 @@ export class FixedLayout extends HTMLElement {
         }
         this.#prerenderedSpreads.clear()
         this.#spreadAccessTime.clear()
-        this.#overlayers.clear()
-        this.goToSpread(index, this.rtl ? 'right' : 'left', 'page')
+        if (!this.#scrollMode) this.#overlayers.clear()
+        if (section && !this.#scrollMode) {
+            const { index, side } = this.getSpreadOf(section)
+            this.goToSpread(index, side, 'page')
+        }
     }
     get index() {
         if (this.#scrollMode) return this.#scrollCurrentIndex >= 0
@@ -1834,6 +1913,8 @@ export class FixedLayout extends HTMLElement {
     async goToSpread(index, side, reason, current = () => true) {
         this.#cancelGesture()
         if (index < 0 || index > this.#spreads.length - 1) return
+        if (!current()) return
+        const serial = ++this.#navigationSerial
         if (index === this.#index) {
             if (side) this.#side = side
             await Promise.all(this.#render(side))
@@ -1842,30 +1923,30 @@ export class FixedLayout extends HTMLElement {
         }
         if (!current()) return
         const spread = this.#spreads[index]
+        this.#pendingSection = spread[side] ?? spread.center ?? spread.left ?? spread.right
+        const isCurrent = current
+        current = () => serial === this.#navigationSerial && isCurrent() && !this.#destroyed && spread === this.#spreads[index] && !this.#scrollMode
         const cacheKey = `spread-${index}`
         const cached = this.#preloadCache.get(cacheKey)
         if (cached && cached !== 'loading') {
             if (cached.center) {
                 const sectionIndex = this.book.sections.indexOf(spread.center)
                 if (!current()) return
-                this.#index = index
-                await this.#showSpread({ center: { index: sectionIndex, src: cached.center }, spreadIndex: index, side })
+                await this.#showSpread({ center: { index: sectionIndex, src: cached.center }, spreadIndex: index, side }, current)
             } else {
                 const indexL = this.book.sections.indexOf(spread.left)
                 const indexR = this.book.sections.indexOf(spread.right)
                 const left = { index: indexL, src: cached.left }
                 const right = { index: indexR, src: cached.right }
                 if (!current()) return
-                this.#index = index
-                await this.#showSpread({ left, right, side, spreadIndex: index })
+                await this.#showSpread({ left, right, side, spreadIndex: index }, current)
             }
         } else {
             if (spread.center) {
                 const sectionIndex = this.book.sections.indexOf(spread.center)
                 const src = await spread.center?.load?.()
                 if (!current()) return
-                this.#index = index
-                await this.#showSpread({ center: { index: sectionIndex, src }, spreadIndex: index, side })
+                await this.#showSpread({ center: { index: sectionIndex, src }, spreadIndex: index, side }, current)
             } else {
                 const indexL = this.book.sections.indexOf(spread.left)
                 const indexR = this.book.sections.indexOf(spread.right)
@@ -1874,12 +1955,12 @@ export class FixedLayout extends HTMLElement {
                 const left = { index: indexL, src: srcL }
                 const right = { index: indexR, src: srcR }
                 if (!current()) return
-                this.#index = index
-                await this.#showSpread({ left, right, side, spreadIndex: index })
+                await this.#showSpread({ left, right, side, spreadIndex: index }, current)
             }
         }
 
-        if (current()) this.#reportLocation(reason)
+        if (!current()) return
+        this.#reportLocation(reason)
         this.#preloadNextSpreads()
     }
     #preloadNextSpreads() {
@@ -1946,6 +2027,7 @@ export class FixedLayout extends HTMLElement {
             for (const side of sides) {
                 const section = spread[side]
                 const src = await section?.load?.()
+                if (this.#destroyed || this.#spreads[index] !== spread) break
                 sources[side] = src
                 const frame = await this.#createFrame({
                     index: this.book.sections.indexOf(section), src, detached: true,
@@ -1953,13 +2035,17 @@ export class FixedLayout extends HTMLElement {
                 frames[side] = frame
                 if (frame.onZoom) await this.#drawPDFFrame(frame, this.#totalScaleFactor)
             }
+            if (this.#destroyed || this.#spreads[index] !== spread) {
+                for (const frame of Object.values(frames)) frame.element.remove()
+                return
+            }
             this.#preloadCache.set(key, sources)
             this.#prerenderedSpreads.set(key, frames)
             this.#spreadAccessTime.set(key, Date.now())
         })()
         this.#spreadLoads.set(key, load)
         try { await load }
-        finally { this.#spreadLoads.delete(key) }
+        finally { if (this.#spreadLoads.get(key) === load) this.#spreadLoads.delete(key) }
     }
     #cleanupPreloadCache() {
         const maxSpreads = this.#maxCachedSpreads
@@ -2100,6 +2186,15 @@ export class FixedLayout extends HTMLElement {
         if (rect?.height === 0 && anchor?.startContainer?.nodeType === Node.ELEMENT_NODE)
             rect = anchor.startContainer.getBoundingClientRect?.() ?? rect
         if (!rect) return
+        if (this.#atlasSheet && !this.#scrollMode) {
+            const point = this.#pagePoint(frameRect, rect.left / iframe.clientWidth,
+                rect.top / iframe.clientHeight)
+            if (point.y < hostRect.top || point.y > hostRect.bottom)
+                this.scrollTop += point.y - hostRect.top - 24
+            if (point.x < hostRect.left || point.x > hostRect.right)
+                this.scrollLeft += point.x - hostRect.left - 24
+            return
+        }
         this.scrollTop += frameRect.top + rect.top * scale - hostRect.top - 24
         const left = frameRect.left + rect.left * scale
         const right = frameRect.left + rect.right * scale
@@ -2115,9 +2210,10 @@ export class FixedLayout extends HTMLElement {
         const host = this.getBoundingClientRect()
         // Move the viewport over the intact page. Every original margin and
         // annotation remains reachable, in the same document coordinate system.
-        this.scrollTop += frame.top + (rect.y + rect.height / 2) * frame.height
+        const center = this.#pagePoint(frame, rect.x + rect.width / 2, rect.y + rect.height / 2)
+        this.scrollTop += center.y
             - host.top - (viewport.y + viewport.height / 2) * host.height
-        this.scrollLeft += frame.left + (rect.x + rect.width / 2) * frame.width
+        this.scrollLeft += center.x
             - host.left - (viewport.x + viewport.width / 2) * host.width
         this.#reportLocation('navigation')
     }
